@@ -2036,8 +2036,6 @@ const SUPPRESSED_TAG_NAMES = new Set([
   "commentary",
   "thought",
   "thinking",
-  "attempt_completion",
-  "result",
   "function_calls",
   "tool_response",
   "exec_command",
@@ -2053,6 +2051,11 @@ const SUPPRESSED_TAG_NAMES = new Set([
   "shell_command",
   "run_command",
   "terminal",
+]);
+
+const STRIP_TAGS = new Set([
+  "attempt_completion",
+  "result",
 ]);
 
 class StreamingXmlFilter {
@@ -2091,9 +2094,12 @@ class StreamingXmlFilter {
         }
 
         if (ch === ">") {
-          const { isSuppressed, isClosing, isSelfClosing } = this._analyzeTag(this.tagBuf);
+          const { isSuppressed, isStripOnly, isClosing, isSelfClosing } = this._analyzeTag(this.tagBuf);
 
-          if (isSuppressed) {
+          if (isStripOnly) {
+            if (this.suppressDepth === 0) this.state = "NORMAL";
+            else this.state = "SUPPRESSED";
+          } else if (isSuppressed) {
             if (isClosing) {
               if (this.suppressDepth > 0) this.suppressDepth--;
               if (this.suppressDepth === 0) this.state = "NORMAL";
@@ -2128,9 +2134,9 @@ class StreamingXmlFilter {
         this.tagBuf += ch;
 
         if (ch === ">") {
-          const { isSuppressed, isClosing, isSelfClosing } = this._analyzeTag(this.tagBuf);
+          const { isSuppressed, isStripOnly, isClosing, isSelfClosing } = this._analyzeTag(this.tagBuf);
 
-          if (isSuppressed) {
+          if (isSuppressed && !isStripOnly) {
             if (isClosing) {
               if (this.suppressDepth > 0) this.suppressDepth--;
             } else if (!isSelfClosing) {
@@ -2182,6 +2188,7 @@ class StreamingXmlFilter {
     const match = clean.match(/^(?:[^\w\s<>]*DSML[^\w\s<>]*)?(?:[a-zA-Z0-9_]+:)?([a-zA-Z0-9_]+)/i);
     const rawTagName = match ? match[1].toLowerCase() : "";
 
+    const isStripOnly = STRIP_TAGS.has(rawTagName);
     let isSuppressed = SUPPRESSED_TAG_NAMES.has(rawTagName);
 
     if (rawTagName === "textarea") {
@@ -2196,7 +2203,7 @@ class StreamingXmlFilter {
       isSuppressed = true;
     }
 
-    return { isSuppressed, isClosing, isSelfClosing, tagName: rawTagName };
+    return { isSuppressed, isStripOnly, isClosing, isSelfClosing, tagName: rawTagName };
   }
 }
 
@@ -2214,12 +2221,19 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
     return m.startsWith("</") ? `</${tag}` : `<${tag}`;
   });
   
+  // Extract attempt_completion / result content directly into cleanedText (this is the final answer)
+  cleanedText = cleanedText.replace(/<attempt_completion[^>]*>([\s\S]*?)<\/attempt_completion>/gi, (match, inner) => {
+    const rMatch = /<result[^>]*>([\s\S]*?)<\/result>/i.exec(inner);
+    return rMatch ? rMatch[1] : inner;
+  });
+  cleanedText = cleanedText.replace(/<\/?(?:attempt_completion|result)[^>]*>/gi, "");
+
   const toolCalls = [];
   const commentaryParts = [];
 
-  const commentaryRegex = /<textarea\s+placeholder=["']commentary["']>([\s\S]*?)<\/textarea>|<commentary>([\s\S]*?)<\/commentary>|<thought>([\s\S]*?)<\/thought>|<thinking>([\s\S]*?)<\/thinking>|<attempt_completion[^>]*>([\s\S]*?)<\/attempt_completion>|<result[^>]*>([\s\S]*?)<\/result>|<function_calls[^>]*>([\s\S]*?)<\/function_calls>|<tool_response[^>]*>([\s\S]*?)<\/tool_response>/gi;
-  cleanedText = cleanedText.replace(commentaryRegex, (match, p1, p2, p3, p4, p5, p6, p7, p8) => {
-    const text = (p1 || p2 || p3 || p4 || p5 || p6 || p7 || p8 || "").trim();
+  const commentaryRegex = /<textarea\s+placeholder=["']commentary["']>([\s\S]*?)<\/textarea>|<commentary>([\s\S]*?)<\/commentary>|<thought>([\s\S]*?)<\/thought>|<thinking>([\s\S]*?)<\/thinking>|<function_calls[^>]*>([\s\S]*?)<\/function_calls>|<tool_response[^>]*>([\s\S]*?)<\/tool_response>/gi;
+  cleanedText = cleanedText.replace(commentaryRegex, (match, p1, p2, p3, p4, p5, p6) => {
+    const text = (p1 || p2 || p3 || p4 || p5 || p6 || "").trim();
     if (text) commentaryParts.push(text);
     return "";
   });
