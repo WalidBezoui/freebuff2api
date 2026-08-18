@@ -1399,9 +1399,41 @@ function responsesInputToMessages(input, instructions) {
       continue;
     }
 
+function extractToolOutputText(item) {
+  if (!item || typeof item !== "object") return "";
+  const o = item.output !== undefined ? item.output : item;
+  if (typeof o === "string") return o;
+  if (typeof o === "number" || typeof o === "boolean") return String(o);
+  if (Array.isArray(o)) {
+    return o.map(p => typeof p === "string" ? p : (p?.text || p?.content || JSON.stringify(p))).join("");
+  }
+  if (typeof o === "object" && o !== null) {
+    if (typeof o.stdout === "string" && typeof o.stderr === "string") {
+      const parts = [];
+      if (o.stdout.trim()) parts.push(o.stdout);
+      if (o.stderr.trim()) parts.push(o.stderr);
+      if (parts.length) return parts.join("\n");
+    }
+    if (typeof o.stdout === "string" && o.stdout.trim()) return o.stdout;
+    if (typeof o.stderr === "string" && o.stderr.trim()) return o.stderr;
+    if (typeof o.output === "string") return o.output;
+    if (typeof o.formatted_output === "string") return o.formatted_output;
+    if (typeof o.text === "string") return o.text;
+    if (typeof o.result === "string") return o.result;
+    if (typeof o.content === "string") return o.content;
+    if (Array.isArray(o.content)) {
+      return o.content.map(p => typeof p === "string" ? p : (p?.text || p?.content || "")).join("");
+    }
+    if (typeof item.stdout === "string" && item.stdout.trim()) return item.stdout;
+    if (typeof item.stderr === "string" && item.stderr.trim()) return item.stderr;
+    try { return JSON.stringify(o); } catch { return String(o); }
+  }
+  return "";
+}
+
     // Standard function_call_output (tool result)
     if (item.type === "function_call_output") {
-      const textOut = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "");
+      const textOut = extractToolOutputText(item);
       messages.push({
         role: "tool",
         name: "exec_command",
@@ -1413,27 +1445,7 @@ function responsesInputToMessages(input, instructions) {
 
     // Codex v0.147 custom_tool_call_output = exec result
     if (item.type === "custom_tool_call_output") {
-      // Try every plausible field name used by Codex/OpenAI for tool results
-      let outputText = "";
-      if (typeof item.output === "string") {
-        outputText = item.output;
-      } else if (typeof item.output?.output === "string") {
-        outputText = item.output.output;
-      } else if (typeof item.output?.text === "string") {
-        outputText = item.output.text;
-      } else if (Array.isArray(item.output)) {
-        outputText = item.output.map(p => typeof p === "string" ? p : (p?.text || p?.content || "")).join("");
-      } else if (typeof item.content === "string") {
-        outputText = item.content;
-      } else if (Array.isArray(item.content)) {
-        outputText = item.content.map(p => typeof p === "string" ? p : (p?.text || p?.content || "")).join("");
-      } else if (typeof item.text === "string") {
-        outputText = item.text;
-      } else if (typeof item.result === "string") {
-        outputText = item.result;
-      } else if (item.output != null) {
-        outputText = JSON.stringify(item.output);
-      }
+      const outputText = extractToolOutputText(item);
       messages.push({
         role: "tool",
         name: "exec_command",
