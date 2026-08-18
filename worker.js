@@ -1779,8 +1779,6 @@ async function handleAnthropicMessages(request, env) {
   return new Response(response.body.pipeThrough(anthropicStream(mc)), { status: response.status, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
 }
 
-
-
 function unwrapData(obj) {
   if (obj && obj.data && typeof obj.data === "object" && (obj.data.choices || obj.data.id || obj.data.usage)) return obj.data;
   return obj;
@@ -1863,10 +1861,6 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
 }
 
 function sanitizeToolPayload(rawFnName, args, clientTools = []) {
-  // Detect which exec tool name Codex registered in this session.
-  // Codex v0.147 registers "exec" (with field "command").
-  // Older builds registered "exec_command" (with field "cmd").
-  // Default: prefer "exec"/"command" unless the client explicitly lists "exec_command".
   let hasExecCommand = false;
   let hasExec = false;
   if (Array.isArray(clientTools)) {
@@ -1884,11 +1878,9 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
     n === "functions.exec" || n === "shell_command";
 
   if (isExecLike) {
-    // Prefer exec_command only if client explicitly listed it and NOT exec
     if (hasExecCommand && !hasExec) {
       fnName = "exec_command";
     } else {
-      // Default: "exec" (Codex v0.147 standard)
       fnName = "exec";
     }
   } else if (n === "patch" || n === "edit_file" || n === "write_file") {
@@ -1900,17 +1892,14 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
   if (!args || typeof args !== "object") return { fnName, args };
   const clean = {};
   if (isExecLike || fnName === "exec" || fnName === "exec_command" || fnName === "shell_command") {
-    // Extract the command string from whichever field the model used
     const cmdVal = typeof args.command === "string" ? args.command
       : typeof args.cmd === "string" ? args.cmd
       : typeof args.input === "string" ? args.input
       : typeof args.code === "string" ? args.code
       : "";
-    // Emit the correct field name for the registered tool
     if (fnName === "exec_command") {
       clean.cmd = cmdVal;
     } else {
-      // exec (Codex v0.147) expects "command"
       clean.command = cmdVal;
     }
     if (typeof args.workdir === "string" && args.workdir) clean.workdir = args.workdir;
@@ -1927,44 +1916,196 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
   return { fnName, args };
 }
 
+const SUPPRESSED_TAG_NAMES = new Set([
+  "tool_calls",
+  "tool_call",
+  "invoke",
+  "parameter",
+  "commentary",
+  "thought",
+  "thinking",
+  "attempt_completion",
+  "result",
+  "function_calls",
+  "tool_response",
+]);
+
+class StreamingXmlFilter {
+  constructor() {
+    this.state = "NORMAL"; // "NORMAL" | "TAG_READING" | "SUPPRESSED" | "SUPPRESSED_TAG_READING"
+    this.tagBuf = "";
+    this.suppressDepth = 0;
+  }
+
+  feed(chunk) {
+    if (!chunk || typeof chunk !== "string") return "";
+    let output = "";
+
+    for (let i = 0; i < chunk.length; i++) {
+      const ch = chunk[i];
+
+      if (this.state === "NORMAL") {
+        if (ch === "<") {
+          this.state = "TAG_READING";
+          this.tagBuf = "<";
+        } else {
+          output += ch;
+        }
+      } else if (this.state === "TAG_READING") {
+        this.tagBuf += ch;
+
+        // Check if literal comparison operator (e.g. "< " or "< 5")
+        if (this.tagBuf.length === 2) {
+          const second = this.tagBuf[1];
+          if (/\s|\d|[=+\-*/]/.test(second)) {
+            output += this.tagBuf;
+            this.tagBuf = "";
+            this.state = "NORMAL";
+            continue;
+          }
+        }
+
+        if (ch === ">") {
+          const { isSuppressed, isClosing, isSelfClosing } = this._analyzeTag(this.tagBuf);
+
+          if (isSuppressed) {
+            if (isClosing) {
+              if (this.suppressDepth > 0) this.suppressDepth--;
+              if (this.suppressDepth === 0) this.state = "NORMAL";
+              else this.state = "SUPPRESSED";
+            } else if (isSelfClosing) {
+              if (this.suppressDepth === 0) this.state = "NORMAL";
+              else this.state = "SUPPRESSED";
+            } else {
+              this.suppressDepth++;
+              this.state = "SUPPRESSED";
+            }
+          } else {
+            if (this.suppressDepth === 0) {
+              output += this.tagBuf;
+              this.state = "NORMAL";
+            } else {
+              this.state = "SUPPRESSED";
+            }
+          }
+          this.tagBuf = "";
+        } else if (this.tagBuf.length > 500) {
+          output += this.tagBuf;
+          this.tagBuf = "";
+          this.state = "NORMAL";
+        }
+      } else if (this.state === "SUPPRESSED") {
+        if (ch === "<") {
+          this.state = "SUPPRESSED_TAG_READING";
+          this.tagBuf = "<";
+        }
+      } else if (this.state === "SUPPRESSED_TAG_READING") {
+        this.tagBuf += ch;
+
+        if (ch === ">") {
+          const { isSuppressed, isClosing, isSelfClosing } = this._analyzeTag(this.tagBuf);
+
+          if (isSuppressed) {
+            if (isClosing) {
+              if (this.suppressDepth > 0) this.suppressDepth--;
+            } else if (!isSelfClosing) {
+              this.suppressDepth++;
+            }
+          }
+
+          if (this.suppressDepth === 0) {
+            this.state = "NORMAL";
+          } else {
+            this.state = "SUPPRESSED";
+          }
+          this.tagBuf = "";
+        } else if (this.tagBuf.length > 500) {
+          this.tagBuf = "";
+          if (this.suppressDepth === 0) this.state = "NORMAL";
+          else this.state = "SUPPRESSED";
+        }
+      }
+    }
+
+    return output;
+  }
+
+  flush() {
+    let output = "";
+    if (this.state === "TAG_READING" && this.tagBuf) {
+      const cleanTag = this.tagBuf.replace(/[^\w\s<>]/g, "");
+      const isLikelySuppressed = Array.from(SUPPRESSED_TAG_NAMES).some(tag => cleanTag.toLowerCase().includes(tag));
+      if (!isLikelySuppressed && this.suppressDepth === 0) {
+        output += this.tagBuf;
+      }
+    }
+    this.tagBuf = "";
+    this.state = "NORMAL";
+    this.suppressDepth = 0;
+    return output;
+  }
+
+  _analyzeTag(rawTagBuf) {
+    const isClosing = /^<\s*\//.test(rawTagBuf);
+    const isSelfClosing = /\/\s*>$/.test(rawTagBuf);
+
+    let clean = rawTagBuf
+      .replace(/<\/?/g, "")
+      .replace(/\/?>$/g, "")
+      .trim();
+
+    const match = clean.match(/^(?:[^\w\s<>]*DSML[^\w\s<>]*)?(?:[a-zA-Z0-9_]+:)?([a-zA-Z0-9_]+)/i);
+    const rawTagName = match ? match[1].toLowerCase() : "";
+
+    let isSuppressed = SUPPRESSED_TAG_NAMES.has(rawTagName);
+
+    if (rawTagName === "textarea") {
+      if (isClosing) {
+        isSuppressed = true;
+      } else {
+        isSuppressed = /placeholder\s*=\s*["']commentary["']/i.test(rawTagBuf);
+      }
+    }
+
+    if (/DSML/i.test(rawTagBuf)) {
+      isSuppressed = true;
+    }
+
+    return { isSuppressed, isClosing, isSelfClosing, tagName: rawTagName };
+  }
+}
+
 function getVisibleCleanText(rawText) {
   if (!rawText || typeof rawText !== "string") return "";
-  let text = rawText.replace(/<\/?(?:[^\w\s<>]*DSML[^\w\s<>]*)?([a-zA-Z_]+)/gi, (m, tag) => {
-    return m.startsWith("</") ? `</${tag}` : `<${tag}`;
-  });
-  text = text.replace(/<textarea\s+placeholder=["']commentary["'][^>]*>[\s\S]*?(?:<\/textarea>|$)/gi, "");
-  text = text.replace(/<(?:commentary|thought|thinking)[^>]*>[\s\S]*?(?:<\/(?:commentary|thought|thinking)>|$)/gi, "");
-  text = text.replace(/<tool_calls[^>]*>[\s\S]*?(?:<\/tool_calls>|$)/gi, "");
-  text = text.replace(/<(?:invoke|tool_call)[^>]*>[\s\S]*?(?:<\/(?:invoke|tool_call)>|$)/gi, "");
-  text = text.replace(/<parameter[^>]*>[\s\S]*?(?:<\/parameter>|$)/gi, "");
-  text = text.replace(/<[^\s>]*$/gi, "");
-  return text;
+  const filter = new StreamingXmlFilter();
+  const out = filter.feed(rawText);
+  return out + filter.flush();
 }
 
 function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
   if (!rawText || typeof rawText !== "string") return { cleanedText: rawText || "", commentary: "", toolCalls: [] };
   
-  let cleanedText = rawText.replace(/<\/?(?:[^\w\s<>]*DSML[^\w\s<>]*)?([a-zA-Z_]+)/gi, (m, tag) => {
+  let cleanedText = rawText.replace(/<\/?(?:[^\w\s<>]*DSML[^\w\s<>]*)?([a-zA-Z0-9_]+)/gi, (m, tag) => {
     return m.startsWith("</") ? `</${tag}` : `<${tag}`;
   });
   
   const toolCalls = [];
   const commentaryParts = [];
 
-  const commentaryRegex = /<textarea\s+placeholder=["']commentary["']>([\s\S]*?)<\/textarea>|<commentary>([\s\S]*?)<\/commentary>|<thought>([\s\S]*?)<\/thought>|<thinking>([\s\S]*?)<\/thinking>/gi;
-  cleanedText = cleanedText.replace(commentaryRegex, (match, p1, p2, p3, p4) => {
-    const text = (p1 || p2 || p3 || p4 || "").trim();
+  const commentaryRegex = /<textarea\s+placeholder=["']commentary["']>([\s\S]*?)<\/textarea>|<commentary>([\s\S]*?)<\/commentary>|<thought>([\s\S]*?)<\/thought>|<thinking>([\s\S]*?)<\/thinking>|<attempt_completion[^>]*>([\s\S]*?)<\/attempt_completion>|<result[^>]*>([\s\S]*?)<\/result>|<function_calls[^>]*>([\s\S]*?)<\/function_calls>|<tool_response[^>]*>([\s\S]*?)<\/tool_response>/gi;
+  cleanedText = cleanedText.replace(commentaryRegex, (match, p1, p2, p3, p4, p5, p6, p7, p8) => {
+    const text = (p1 || p2 || p3 || p4 || p5 || p6 || p7 || p8 || "").trim();
     if (text) commentaryParts.push(text);
     return "";
   });
 
-  const invokeRegex = /<(?:invoke|tool_call)\s+name=["']([^"']+)["']>([\s\S]*?)<\/(?:invoke|tool_call)>/gi;
+  const invokeRegex = /<(?:[a-zA-Z0-9_]+:)?(?:invoke|tool_call)\s+name=["']([^"']+)["']>([\s\S]*?)<\/(?:[a-zA-Z0-9_]+:)?(?:invoke|tool_call)>/gi;
   let match;
   while ((match = invokeRegex.exec(cleanedText)) !== null) {
     const fnName = match[1].trim();
     const body = match[2];
     let args = {};
-    const paramRegex = /<parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)(?:<\/parameter>|(?=<parameter|<\/(?:invoke|tool_call)|$))/gi;
+    const paramRegex = /<parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)(?:<\/parameter>|(?=<parameter|<\/(?:[a-zA-Z0-9_]+:)?(?:invoke|tool_call)|$))/gi;
     let pMatch;
     let hasParams = false;
     while ((pMatch = paramRegex.exec(body)) !== null) {
@@ -1978,9 +2119,9 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
       try {
         const parsed = JSON.parse(body.trim());
         if (typeof parsed === "object" && parsed !== null) Object.assign(args, parsed);
-        else args["cmd"] = body.trim();
+        else args["command"] = body.trim();
       } catch {
-        if (body.trim()) args["cmd"] = body.trim();
+        if (body.trim()) args["command"] = body.trim();
       }
     }
     
@@ -1992,11 +2133,7 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
     });
   }
 
-  cleanedText = cleanedText
-    .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/gi, "")
-    .replace(/<(?:invoke|tool_call)\s+name=["'][^"']+["']>[\s\S]*?<\/(?:invoke|tool_call)>/gi, "")
-    .replace(/<\/?(?:tool_calls|tool_call|invoke|parameter|textarea)>/gi, "")
-    .trim();
+  cleanedText = getVisibleCleanText(cleanedText).trim();
 
   return { cleanedText, commentary: commentaryParts.join("\n\n"), toolCalls };
 }
@@ -2056,6 +2193,7 @@ function chatUsageToResponsesUsage(usage) {
     total_tokens: totalTokens,
   };
 }
+
 // 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
 async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete, clientTools = []) {
   const reader = upstreamBody.getReader();
@@ -2069,7 +2207,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
 
   let contentItem = null;
   let rawTextAccumulator = "";
-  let alreadyEmittedCleanLength = 0;
+  const xmlFilter = new StreamingXmlFilter();
   const nativeToolItems = new Map(); // 上游原生 tool_calls index → {id, callId, name, args}
 
   (async () => {
@@ -2120,11 +2258,10 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
               }
             }
 
-            // 文本增量：实时过滤 DSML / commentary / tool_calls 标签，绝不把 XML 泄露给客户端
+            // 文本增量：实时过滤 DSML / commentary / tool_calls / attempt_completion 标签，绝不把 XML 泄露给客户端
             if (delta.content) {
               rawTextAccumulator += delta.content;
-              const visibleClean = getVisibleCleanText(rawTextAccumulator);
-              const newDelta = visibleClean.slice(alreadyEmittedCleanLength);
+              const newDelta = xmlFilter.feed(delta.content);
               if (newDelta.length > 0) {
                 if (!contentItem) {
                   contentItem = {
@@ -2139,12 +2276,17 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
                   await send({ type: "response.content_part.added", item_id: contentItem.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
                 }
                 contentItem.text += newDelta;
-                alreadyEmittedCleanLength += newDelta.length;
                 await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: 0, content_index: 0, delta: newDelta });
               }
             }
           } catch {}
         }
+      }
+
+      const flushed = xmlFilter.flush();
+      if (flushed && contentItem) {
+        contentItem.text += flushed;
+        await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: 0, content_index: 0, delta: flushed });
       }
 
       // 收尾：统一解析 XML tool calls 和 commentary
