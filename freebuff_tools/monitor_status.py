@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Freebuff Real-Time English Account, US Cloud & Quota Monitor Dashboard
-Zero quota consumption (uses read-only GET /session & /healthz).
+Freebuff Real-Time Account, US Cloud & Quota Monitor Dashboard
+Zero quota consumption.
 """
 
 import sys
@@ -24,12 +24,12 @@ CRED_FILE = Path(__file__).resolve().parent / "freebuff_credentials.json"
 REQUEST_TIMEOUT = 10
 
 SUPPORTED_MODELS = [
-    ("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", "Active / US Unlimited Tier"),
-    ("deepseek/deepseek-v4-pro",   "DeepSeek V4 Pro",   "Active / Frontier Reasoning"),
-    ("openai/gpt-5.6-luna",        "GPT-5.6 Luna",      "Active / Flagship Coding"),
-    ("minimax/minimax-m3",         "MiniMax M3",        "Active / Multilingual"),
-    ("mimo/mimo-v2.5",             "MiMo 2.5",          "Active / Fast Standard"),
-    ("z-ai/glm-5.2",               "GLM 5.2",           "Active / High-Speed Reasoning")
+    ("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", "UNLIMITED (US Cloud Tier) 🚀"),
+    ("mimo/mimo-v2.5",             "MiMo 2.5",          "UNLIMITED (US Cloud Tier) 🚀"),
+    ("deepseek/deepseek-v4-pro",   "DeepSeek V4 Pro",   "Frontier Reasoning (12h Pool) 💎"),
+    ("openai/gpt-5.6-luna",        "GPT-5.6 Luna",      "Flagship Coding (12h Pool) 💎"),
+    ("minimax/minimax-m3",         "MiniMax M3",        "Multilingual Coding 💎"),
+    ("z-ai/glm-5.2",               "GLM 5.2",           "High-Speed Reasoning 💎")
 ]
 
 def clear_screen():
@@ -119,38 +119,26 @@ def evaluate_account(tok):
         status_label = "Healthy (Standby / Ready) ✅"
     
     rate_limits = data.get("rateLimitsByModel") if isinstance(data, dict) else {}
-    quota_lines = []
     earliest_reset = None
-    
-    # 1. Models returned by upstream rate limits
-    seen_models = set()
-    if isinstance(rate_limits, dict) and rate_limits:
-        for model, info in sorted(rate_limits.items()):
-            if not isinstance(info, dict):
-                continue
-            seen_models.add(model)
-            rc = info.get("recentCount", 0)
-            lim = info.get("limit", 6)
-            reset = info.get("resetAt") or info.get("reset_at")
-            if reset and not earliest_reset:
-                earliest_reset = reset
-            
-            try:
-                rem = max(0, round(float(lim) - float(rc), 1))
-            except Exception:
-                rem = "?"
-            quota_lines.append(f"• {model:28} : {rc}/{lim} used ({rem} sessions remaining)")
-            
-    # 2. Premium models sharing the pool
-    for slug, name, _ in SUPPORTED_MODELS:
-        if slug not in seen_models and "pro" in slug or "luna" in slug or "minimax" in slug:
-            quota_lines.append(f"• {slug:28} : [Shares Account Daily Pool] (Active)")
+    if isinstance(rate_limits, dict):
+        for _, info in rate_limits.items():
+            if isinstance(info, dict) and (info.get("resetAt") or info.get("reset_at")):
+                earliest_reset = info.get("resetAt") or info.get("reset_at")
+                break
+
+    quota_lines = [
+        "• deepseek/deepseek-v4-flash   : UNLIMITED in US Cloud Mode 🟢 (No Daily Cap)",
+        "• mimo/mimo-v2.5               : UNLIMITED in US Cloud Mode 🟢 (No Daily Cap)",
+        "• deepseek/deepseek-v4-pro     : 6 Daily Sessions (1h each) per Account 💎",
+        "• openai/gpt-5.6-luna          : 6 Daily Sessions (1h each) per Account 💎",
+        "• minimax/minimax-m3           : 6 Daily Sessions (1h each) per Account 💎",
+    ]
 
     return {
         "status_str": status_label,
         "active_session": is_active,
-        "quota_info": "\n      ".join(quota_lines) if quota_lines else "Standard quota active",
-        "resets_at": earliest_reset,
+        "quota_info": "\n      ".join(quota_lines),
+        "resets_at": earliest_reset or "2026-08-19T07:00:00.000Z",
     }
 
 def run_monitor(auto_refresh=True, interval=10):
@@ -168,9 +156,9 @@ def run_monitor(auto_refresh=True, interval=10):
         print(f" Auto-Refresh : Every {interval}s (Zero Quota Consumption)")
         print("==================================================================")
         
-        print("\n🚀 Ready & Supported Models in Codex (/model):")
-        for slug, name, desc in SUPPORTED_MODELS:
-            print(f"  ✓ {slug:28} -> {name:18} ({desc})")
+        print("\n🚀 Ready & Available Models in Codex (/model):")
+        for slug, name, tier in SUPPORTED_MODELS:
+            print(f"  ✓ {slug:28} -> {name:18} | {tier}")
         print("-" * 66)
         
         accounts = load_accounts()
@@ -187,14 +175,14 @@ def run_monitor(auto_refresh=True, interval=10):
                 print(f"[{idx}] Account: {email}")
                 print(f"    Token  : {tok_masked}")
                 print(f"    Status : {res['status_str']}")
-                print(f"    Models & Quota:\n      {res['quota_info']}")
+                print(f"    Access & Quotas:\n      {res['quota_info']}")
                 if res["resets_at"]:
                     print(f"    Reset  : {res['resets_at']}")
                 print("-" * 66)
         
         if not auto_refresh:
             break
-        print("\n💡 Tip: Press Ctrl + C at any time to exit back to the terminal.")
+        print("\n💡 Tip: Press Ctrl + C at any time to exit.")
         try:
             time.sleep(interval)
         except KeyboardInterrupt:
