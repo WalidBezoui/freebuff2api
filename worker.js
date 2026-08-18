@@ -2125,7 +2125,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       const finalItems = [];
       for (const item of items) {
         if (item.kind === "message" && item.text) {
-          const parsed = parseXmlToolCallsAndCommentary(item.text);
+          const parsed = parseXmlToolCallsAndCommentary(item.text, chat?._clientTools || []);
           if (parsed.toolCalls && parsed.toolCalls.length > 0) {
             const remainingText = parsed.cleanedText || parsed.commentary;
             if (remainingText) {
@@ -2136,14 +2136,12 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
               const tcItem = {
                 kind: "function_call",
                 id: "fc_" + Math.random().toString(36).slice(2, 10),
-                outputIndex: nextOutputIndex++,
+                outputIndex: 0,
                 callId: tc.id,
                 name: tc.name,
                 args: tc.arguments,
+                started: false,
               };
-              await send({ type: "response.output_item.added", output_index: tcItem.outputIndex, item: { id: tcItem.id, type: "function_call", status: "in_progress", call_id: tcItem.callId, name: tcItem.name, arguments: "" } });
-              await send({ type: "response.function_call_arguments.delta", item_id: tcItem.id, output_index: tcItem.outputIndex, delta: tcItem.args });
-              await send({ type: "response.function_call_arguments.done", item_id: tcItem.id, output_index: tcItem.outputIndex, arguments: tcItem.args });
               finalItems.push(tcItem);
             }
             continue;
@@ -2153,6 +2151,11 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         }
         finalItems.push(item);
       }
+
+      // Re-assign clean consecutive output indices (0, 1, 2, ...)
+      finalItems.forEach((item, idx) => {
+        item.outputIndex = idx;
+      });
 
       // 按出现顺序输出每个输出项的 done 事件
       for (const item of finalItems) {
@@ -2169,11 +2172,14 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
           let cleanArgs = item.args;
           try {
             const parsed = JSON.parse(item.args);
-            const sanitized = sanitizeToolPayload(item.name, parsed);
+            const sanitized = sanitizeToolPayload(item.name, parsed, chat?._clientTools || []);
             item.name = sanitized.fnName;
             cleanArgs = JSON.stringify(sanitized.args);
           } catch {}
           item.args = cleanArgs;
+          if (!item.started) {
+            await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" } });
+          }
           await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: cleanArgs });
           await send({ type: "response.function_call_arguments.done", item_id: item.id, output_index: item.outputIndex, arguments: cleanArgs });
           await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args } });
