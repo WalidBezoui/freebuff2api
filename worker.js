@@ -2432,23 +2432,39 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
             cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
           }
           item.args = cleanArgs;
+
+          const isCustom = item.name === "exec";
           if (!item.started) {
-            await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" } });
+            const addedItem = isCustom
+              ? { id: item.id, type: "custom_tool_call", status: "in_progress", call_id: item.callId, name: item.name, input: "" }
+              : { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" };
+            await send({ type: "response.output_item.added", output_index: item.outputIndex, item: addedItem });
           }
-          await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: cleanArgs });
-          await send({ type: "response.function_call_arguments.done", item_id: item.id, output_index: item.outputIndex, arguments: cleanArgs });
-          await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args } });
+
+          if (isCustom) {
+            await send({ type: "response.custom_tool_call_input.delta", item_id: item.id, output_index: item.outputIndex, delta: cleanArgs });
+            await send({ type: "response.custom_tool_call_input.done", item_id: item.id, output_index: item.outputIndex, input: cleanArgs });
+            await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "custom_tool_call", status: "completed", call_id: item.callId, name: item.name, input: item.args } });
+          } else {
+            await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: cleanArgs });
+            await send({ type: "response.function_call_arguments.done", item_id: item.id, output_index: item.outputIndex, arguments: cleanArgs });
+            await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args } });
+          }
         }
       }
 
       const resp = responsesBase(mc, respId, createdAt);
       resp.status = "completed";
       resp.model = model || mc.id;
-      resp.output = finalItems.map((item) =>
-        item.kind === "message"
-          ? { id: item.id, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: item.text, annotations: [] }] }
-          : { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args }
-      );
+      resp.output = finalItems.map((item) => {
+        if (item.kind === "message") {
+          return { id: item.id, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: item.text, annotations: [] }] };
+        }
+        if (item.name === "exec") {
+          return { id: item.id, type: "custom_tool_call", status: "completed", call_id: item.callId, name: item.name, input: item.args };
+        }
+        return { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args };
+      });
       resp.usage = chatUsageToResponsesUsage(usage);
       await send({ type: "response.completed", response: resp });
     } catch (err) {
@@ -2524,18 +2540,33 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = []) {
       });
     }
     for (const tc of parsed.toolCalls) {
-      resp.output.push({
-        id: "fc_" + Math.random().toString(36).slice(2, 10),
-        type: "function_call",
-        status: "completed",
-        call_id: tc.id,
-        name: tc.name,
-        arguments: tc.arguments,
-      });
+      if (tc.name === "exec") {
+        resp.output.push({
+          id: "fc_" + Math.random().toString(36).slice(2, 10),
+          type: "custom_tool_call",
+          status: "completed",
+          call_id: tc.id,
+          name: tc.name,
+          input: tc.arguments,
+        });
+      } else {
+        resp.output.push({
+          id: "fc_" + Math.random().toString(36).slice(2, 10),
+          type: "function_call",
+          status: "completed",
+          call_id: tc.id,
+          name: tc.name,
+          arguments: tc.arguments,
+        });
+      }
     }
   }
   for (const item of toolItems.values()) {
-    resp.output.push({ id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args });
+    if (item.name === "exec") {
+      resp.output.push({ id: item.id, type: "custom_tool_call", status: "completed", call_id: item.callId, name: item.name, input: item.args });
+    } else {
+      resp.output.push({ id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args });
+    }
   }
   resp.usage = chatUsageToResponsesUsage(usage);
   return resp;
