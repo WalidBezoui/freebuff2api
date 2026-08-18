@@ -1551,12 +1551,12 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
 
       if (isStream) {
         const { readable, writable } = new TransformStream();
-        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc);
+        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, null, chatParams?._clientTools || []);
         else pipeUpstreamToClient(resp.body, writable);
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
 
-      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc), 200);
+      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc, chatParams?._clientTools || []), 200);
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
       return jsonResponse(agg, 200);
@@ -2014,7 +2014,7 @@ function chatUsageToResponsesUsage(usage) {
 }
 
 // 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
-async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete) {
+async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete, clientTools = []) {
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
   const decoder = new TextDecoder();
@@ -2049,7 +2049,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       id: "fc_" + Math.random().toString(36).slice(2, 10),
       outputIndex: nextOutputIndex++,
       callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
-      name: mapToolName(fn.name || ""),
+      name: fn.name || "",
       args: "",
     };
     items.push(item);
@@ -2091,7 +2091,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
                   await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" } });
                 }
                 const fn = tc.function || {};
-                if (fn.name && !item.name) item.name = mapToolName(fn.name);
+                if (fn.name && !item.name) item.name = fn.name;
                 if (fn.arguments) {
                   item.args += fn.arguments;
                 }
@@ -2125,7 +2125,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       const finalItems = [];
       for (const item of items) {
         if (item.kind === "message" && item.text) {
-          const parsed = parseXmlToolCallsAndCommentary(item.text, chat?._clientTools || []);
+          const parsed = parseXmlToolCallsAndCommentary(item.text, clientTools);
           if (parsed.toolCalls && parsed.toolCalls.length > 0) {
             const remainingText = parsed.cleanedText || parsed.commentary;
             if (remainingText) {
