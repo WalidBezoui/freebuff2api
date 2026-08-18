@@ -2094,84 +2094,113 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
               }
             }
 
-            // 文本增量
+            // 文本增量：实时过滤 DSML / commentary / tool_calls 标签，绝不把 XML 泄露给客户端
             if (delta.content) {
-              if (!contentItem) contentItem = startContent();
-              if (!contentItem.started) {
-                contentItem.started = true;
-                await send({ type: "response.output_item.added", output_index: contentItem.outputIndex, item: { id: contentItem.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
-                await send({ type: "response.content_part.added", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: contentItem.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
+              rawTextAccumulator += delta.content;
+              const visibleClean = getVisibleCleanText(rawTextAccumulator);
+              const newDelta = visibleClean.slice(alreadyEmittedCleanLength);
+              if (newDelta.length > 0) {
+                if (!contentItem) {
+                  contentItem = {
+                    kind: "message",
+                    id: "msg_" + Math.random().toString(36).slice(2, 10),
+                    outputIndex: 0,
+                    text: "",
+                    contentIndex: 0,
+                    started: true,
+                  };
+                  await send({ type: "response.output_item.added", output_index: 0, item: { id: contentItem.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
+                  await send({ type: "response.content_part.added", item_id: contentItem.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+                }
+                contentItem.text += newDelta;
+                alreadyEmittedCleanLength += newDelta.length;
+                await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: 0, content_index: 0, delta: newDelta });
               }
-              contentItem.text += delta.content;
-              await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: contentItem.contentIndex, delta: delta.content });
             }
           } catch {}
         }
       }
 
-      // 既无文本也无工具调用时补一个空 message，避免 output 为空数组
-      if (items.length === 0) {
-        const item = startContent();
-        item.started = true;
-        await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
-        await send({ type: "response.content_part.added", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
+      // 收尾：统一解析 XML tool calls 和 commentary
+      const finalItems = [];
+      const parsed = parseXmlToolCallsAndCommentary(rawTextAccumulator, clientTools);
+      const cleanMessageText = parsed.cleanedText || "";
+
+      // 仅当确实有干净文本（或者既无工具也无文本时）才添加 message item
+      const hasToolCalls = parsed.toolCalls.length > 0 || nativeToolItems.size > 0;
+      if (contentItem) {
+        contentItem.text = cleanMessageText || contentItem.text;
+        finalItems.push(contentItem);
+      } else if (cleanMessageText.trim().length > 0 || !hasToolCalls) {
+        const textToUse = cleanMessageText || parsed.commentary || "";
+        const msgItem = {
+          kind: "message",
+          id: "msg_" + Math.random().toString(36).slice(2, 10),
+          outputIndex: 0,
+          text: textToUse,
+          contentIndex: 0,
+          started: false,
+        };
+        finalItems.push(msgItem);
       }
 
-      // 收尾：检查是否有 message item 包含 XML tool calls 或 commentary
-      const finalItems = [];
-      for (const item of items) {
-        if (item.kind === "message" && item.text) {
-          const parsed = parseXmlToolCallsAndCommentary(item.text, clientTools);
-          if (parsed.toolCalls && parsed.toolCalls.length > 0) {
-            const remainingText = parsed.cleanedText || parsed.commentary;
-            if (remainingText) {
-              item.text = remainingText;
-              finalItems.push(item);
-            }
-            for (const tc of parsed.toolCalls) {
-              const tcItem = {
-                kind: "function_call",
-                id: "fc_" + Math.random().toString(36).slice(2, 10),
-                outputIndex: 0,
-                callId: tc.id,
-                name: tc.name,
-                args: tc.arguments,
-                started: false,
-              };
-              finalItems.push(tcItem);
-            }
-            continue;
-          } else if (parsed.cleanedText !== item.text) {
-            item.text = parsed.cleanedText || parsed.commentary;
-          }
-        }
+      for (const item of nativeToolItems.values()) {
         finalItems.push(item);
       }
 
-      // Re-assign clean consecutive output indices (0, 1, 2, ...)
+      for (const tc of parsed.toolCalls) {
+        const tcItem = {
+          kind: "function_call",
+          id: "fc_" + Math.random().toString(36).slice(2, 10),
+          outputIndex: 0,
+          callId: tc.id,
+          name: tc.name,
+          args: tc.arguments,
+          started: false,
+        };
+        finalItems.push(tcItem);
+      }
+
+      if (finalItems.length === 0) {
+        const fallbackItem = {
+          kind: "message",
+          id: "msg_" + Math.random().toString(36).slice(2, 10),
+          outputIndex: 0,
+          text: "",
+          contentIndex: 0,
+          started: false,
+        };
+        finalItems.push(fallbackItem);
+      }
+
+      // 重新分配连续的 0-based outputIndex (0, 1, 2, ...)
       finalItems.forEach((item, idx) => {
         item.outputIndex = idx;
       });
 
-      // 按出现顺序输出每个输出项的 done 事件
+      // 按出现顺序输出每个输出项的完成事件
       for (const item of finalItems) {
         if (item.kind === "message") {
           if (!item.started) {
             await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
-            await send({ type: "response.content_part.added", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
+            await send({ type: "response.content_part.added", item_id: item.id, output_index: item.outputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
           }
           const part = { type: "output_text", text: item.text, annotations: [] };
-          await send({ type: "response.output_text.done", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, text: item.text });
-          await send({ type: "response.content_part.done", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part });
+          await send({ type: "response.output_text.done", item_id: item.id, output_index: item.outputIndex, content_index: 0, text: item.text });
+          await send({ type: "response.content_part.done", item_id: item.id, output_index: item.outputIndex, content_index: 0, part });
           await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "completed", role: "assistant", content: [part] } });
         } else {
           let cleanArgs = item.args;
           try {
-            const parsed = JSON.parse(item.args);
-            const sanitized = sanitizeToolPayload(item.name, parsed, clientTools);
+            const rawObj = typeof item.args === "string" ? JSON.parse(item.args) : (item.args || {});
+            const sanitized = sanitizeToolPayload(item.name, rawObj, clientTools);
             item.name = sanitized.fnName;
             cleanArgs = JSON.stringify(sanitized.args);
-          } catch {}
+          } catch {
+            const sanitized = sanitizeToolPayload(item.name, { cmd: item.args }, clientTools);
+            item.name = sanitized.fnName;
+            cleanArgs = JSON.stringify(sanitized.args);
+          }
           item.args = cleanArgs;
           if (!item.started) {
             await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" } });
