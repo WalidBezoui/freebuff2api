@@ -1850,9 +1850,33 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   };
 }
 
+function sanitizeToolPayload(fnName, args) {
+  if (!args || typeof args !== "object") return args;
+  const clean = {};
+  if (fnName === "exec" || fnName === "shell_command") {
+    clean.cmd = typeof args.cmd === "string" ? args.cmd : typeof args.command === "string" ? args.command : typeof args.input === "string" ? args.input : "";
+    if (typeof args.workdir === "string" && args.workdir) clean.workdir = args.workdir;
+    return clean;
+  }
+  if (fnName === "apply_patch") {
+    clean.patch = typeof args.patch === "string" ? args.patch : typeof args.input === "string" ? args.input : "";
+    return clean;
+  }
+  if (fnName === "web_search" || fnName === "fetch_web_search") {
+    clean.query = typeof args.query === "string" ? args.query : typeof args.input === "string" ? args.input : "";
+    return clean;
+  }
+  return args;
+}
+
 function parseXmlToolCallsAndCommentary(rawText) {
   if (!rawText || typeof rawText !== "string") return { cleanedText: rawText || "", commentary: "", toolCalls: [] };
-  let cleanedText = rawText;
+  
+  // Normalize DSML / special unicode tags (e.g. <｜｜DSML｜｜invoke ...>)
+  let cleanedText = rawText.replace(/<\/?(?:[^\w\s<>]*DSML[^\w\s<>]*)?([a-zA-Z_]+)/gi, (m, tag) => {
+    return m.startsWith("</") ? `</${tag}` : `<${tag}`;
+  });
+  
   const toolCalls = [];
   const commentaryParts = [];
 
@@ -1868,8 +1892,8 @@ function parseXmlToolCallsAndCommentary(rawText) {
   while ((match = invokeRegex.exec(cleanedText)) !== null) {
     const fnName = match[1].trim();
     const body = match[2];
-    const args = {};
-    const paramRegex = /<parameter\s+name=["']([^"']+)["']>([\s\S]*?)<\/parameter>/gi;
+    let args = {};
+    const paramRegex = /<parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi;
     let pMatch;
     let hasParams = false;
     while ((pMatch = paramRegex.exec(body)) !== null) {
@@ -1888,6 +1912,8 @@ function parseXmlToolCallsAndCommentary(rawText) {
         if (body.trim()) args["cmd"] = body.trim();
       }
     }
+    
+    args = sanitizeToolPayload(fnName, args);
     toolCalls.push({
       id: "call_" + Math.random().toString(36).slice(2, 10),
       name: fnName,
