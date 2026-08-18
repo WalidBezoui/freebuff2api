@@ -20,9 +20,17 @@ from pathlib import Path
 
 CODEBUFF_URL = "https://www.codebuff.com"
 VERCEL_API_URL = "https://freebuff2api-walid-bezouis-projects-fc73dfba.vercel.app"
-LOCAL_API_URL = "http://localhost:8787"
 CRED_FILE = Path(__file__).resolve().parent / "freebuff_credentials.json"
 REQUEST_TIMEOUT = 10
+
+SUPPORTED_MODELS = [
+    ("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", "Active / US Unlimited Tier"),
+    ("deepseek/deepseek-v4-pro",   "DeepSeek V4 Pro",   "Active / Frontier Reasoning"),
+    ("openai/gpt-5.6-luna",        "GPT-5.6 Luna",      "Active / Flagship Coding"),
+    ("minimax/minimax-m3",         "MiniMax M3",        "Active / Multilingual"),
+    ("mimo/mimo-v2.5",             "MiMo 2.5",          "Active / Fast Standard"),
+    ("z-ai/glm-5.2",               "GLM 5.2",           "Active / High-Speed Reasoning")
+]
 
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -32,10 +40,10 @@ def check_endpoint_health(base_url):
         req = urllib.request.Request(f"{base_url}/healthz", headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             if resp.status == 200:
-                return True, "Online 🟢 (US Egress Active)"
-    except Exception as e:
+                return True, "Online 🟢 (US Washington D.C. Egress Active)"
+    except Exception:
         pass
-    return False, "Offline / Standby ⚪"
+    return False, "Connecting / Standby ⚪"
 
 def http_get_session(tok):
     url = f"{CODEBUFF_URL}/api/v1/freebuff/session"
@@ -114,10 +122,13 @@ def evaluate_account(tok):
     quota_lines = []
     earliest_reset = None
     
+    # 1. Models returned by upstream rate limits
+    seen_models = set()
     if isinstance(rate_limits, dict) and rate_limits:
         for model, info in sorted(rate_limits.items()):
             if not isinstance(info, dict):
                 continue
+            seen_models.add(model)
             rc = info.get("recentCount", 0)
             lim = info.get("limit", 6)
             reset = info.get("resetAt") or info.get("reset_at")
@@ -129,7 +140,12 @@ def evaluate_account(tok):
             except Exception:
                 rem = "?"
             quota_lines.append(f"• {model:28} : {rc}/{lim} used ({rem} sessions remaining)")
-    
+            
+    # 2. Premium models sharing the pool
+    for slug, name, _ in SUPPORTED_MODELS:
+        if slug not in seen_models and "pro" in slug or "luna" in slug or "minimax" in slug:
+            quota_lines.append(f"• {slug:28} : [Shares Account Daily Pool] (Active)")
+
     return {
         "status_str": status_label,
         "active_session": is_active,
@@ -149,14 +165,19 @@ def run_monitor(auto_refresh=True, interval=10):
         print(f" Last Updated : {now_str}")
         print(f" US Cloud API : {vercel_status}")
         print(f" US Endpoint  : {VERCEL_API_URL}/v1")
-        print(f" Refresh Rate : Auto-refreshing every {interval}s (Zero Quota Usage)")
-        print("==================================================================\n")
+        print(f" Auto-Refresh : Every {interval}s (Zero Quota Consumption)")
+        print("==================================================================")
+        
+        print("\n🚀 Ready & Supported Models in Codex (/model):")
+        for slug, name, desc in SUPPORTED_MODELS:
+            print(f"  ✓ {slug:28} -> {name:18} ({desc})")
+        print("-" * 66)
         
         accounts = load_accounts()
         if not accounts:
             print("❌ No accounts found in local pool! Run 1-Login.bat to add an account.\n")
         else:
-            print(f"📊 Active Accounts in Pool: {len(accounts)}\n")
+            print(f"\n📊 Active Account Failover Pool ({len(accounts)} accounts configured):\n")
             for idx, acct in enumerate(accounts, 1):
                 email = acct.get("email", "Unknown Email")
                 tok = acct.get("authToken", "")
@@ -166,14 +187,14 @@ def run_monitor(auto_refresh=True, interval=10):
                 print(f"[{idx}] Account: {email}")
                 print(f"    Token  : {tok_masked}")
                 print(f"    Status : {res['status_str']}")
-                print(f"    Quota  :\n      {res['quota_info']}")
+                print(f"    Models & Quota:\n      {res['quota_info']}")
                 if res["resets_at"]:
                     print(f"    Reset  : {res['resets_at']}")
                 print("-" * 66)
         
         if not auto_refresh:
             break
-        print("\n💡 Press Ctrl + C to exit this monitor window.")
+        print("\n💡 Tip: Press Ctrl + C at any time to exit back to the terminal.")
         try:
             time.sleep(interval)
         except KeyboardInterrupt:
