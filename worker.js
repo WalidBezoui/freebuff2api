@@ -2400,10 +2400,20 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       // 仅当确实有干净文本（或者既无工具也无文本时）才添加 message item
       const hasToolCalls = parsed.toolCalls.length > 0 || nativeToolItems.size > 0;
       if (contentItem) {
-        contentItem.text = cleanMessageText || contentItem.text;
+        // If XML filtering emptied the streamed text, fall back to raw text then to a space
+        // (Codex rejects responses where output_text is completely empty)
+        if (!contentItem.text.trim()) {
+          contentItem.text = cleanMessageText.trim() || rawTextAccumulator.replace(/<[^>]*>/g, "").trim() || " ";
+        } else {
+          contentItem.text = cleanMessageText || contentItem.text;
+        }
         finalItems.push(contentItem);
       } else if (cleanMessageText.trim().length > 0 || !hasToolCalls) {
-        const textToUse = cleanMessageText || parsed.commentary || "";
+        // Fallback priority: clean text → commentary → raw stripped text → single space
+        const textToUse = cleanMessageText.trim() ||
+          (parsed.commentary || "").trim() ||
+          rawTextAccumulator.replace(/<[^>]*>/g, "").trim() ||
+          " ";
         const msgItem = {
           kind: "message",
           id: "msg_" + Math.random().toString(36).slice(2, 10),
@@ -2433,11 +2443,14 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       }
 
       if (finalItems.length === 0) {
+        // Codex requires at least one output with non-empty text OR a tool call.
+        // Use raw stripped text as last resort; single space prevents rejection.
+        const fallbackText = rawTextAccumulator.replace(/<[^>]*>/g, "").trim() || " ";
         const fallbackItem = {
           kind: "message",
           id: "msg_" + Math.random().toString(36).slice(2, 10),
           outputIndex: 0,
-          text: "",
+          text: fallbackText,
           contentIndex: 0,
           started: false,
         };
