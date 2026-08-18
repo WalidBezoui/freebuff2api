@@ -2465,6 +2465,8 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       // 按出现顺序输出每个输出项的完成事件
       for (const item of finalItems) {
         if (item.kind === "message") {
+          // Safety guard: Codex rejects empty output_text. Ensure at least one non-whitespace char.
+          if (!item.text || !item.text.trim()) item.text = " ";
           if (!item.started) {
             await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
             await send({ type: "response.content_part.added", item_id: item.id, output_index: item.outputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
