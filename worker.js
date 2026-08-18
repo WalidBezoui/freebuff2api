@@ -1078,7 +1078,7 @@ const REASONING_EFFORT_RANK = ["minimal", "low", "medium", "high", "xhigh", "max
 const MODEL_EFFORTS = {
   "deepseek/deepseek-v4-flash": ["low", "high", "max"],
   "deepseek/deepseek-v4-pro": ["high", "max"],
-  "openai/gpt-5.6-luna": ["low", "medium", "high", "max"],
+  "openai/gpt-5.6-luna": ["high"],
   "meta/muse-spark-1.2-contributor": ["low", "medium", "high", "xhigh"],
 };
 
