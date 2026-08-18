@@ -2183,7 +2183,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
           let cleanArgs = item.args;
           try {
             const parsed = JSON.parse(item.args);
-            const sanitized = sanitizeToolPayload(item.name, parsed, chat?._clientTools || []);
+            const sanitized = sanitizeToolPayload(item.name, parsed, clientTools);
             item.name = sanitized.fnName;
             cleanArgs = JSON.stringify(sanitized.args);
           } catch {}
@@ -2207,8 +2207,9 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       );
       resp.usage = chatUsageToResponsesUsage(usage);
       await send({ type: "response.completed", response: resp });
-    } catch {}
-    finally {
+    } catch (err) {
+      console.error("[pipeUpstreamToResponsesStream error]", err);
+    } finally {
       try { if (onComplete) await onComplete(); } catch {}
       try { await writer.close(); } catch {}
     }
@@ -2216,7 +2217,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
 }
 
 // 非流式：聚合上游流成 Responses API 非流式对象
-async function responsesToNonStream(upstreamBody, mc) {
+async function responsesToNonStream(upstreamBody, mc, clientTools = []) {
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   let buf = "", model = "", outputText = "", reasoning = "", usage = null;
@@ -2269,7 +2270,7 @@ async function responsesToNonStream(upstreamBody, mc) {
   resp.output = [];
   if (outputText || reasoning) {
     const raw = outputText || reasoning;
-    const parsed = parseXmlToolCallsAndCommentary(raw);
+    const parsed = parseXmlToolCallsAndCommentary(raw, clientTools);
     const text = parsed.cleanedText || parsed.commentary;
     if (text) {
       resp.output.push({
