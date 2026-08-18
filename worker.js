@@ -1319,6 +1319,8 @@ function responsesInputToMessages(input, instructions) {
   for (const item of input) {
     if (typeof item === "string") { messages.push({ role: "user", content: item }); continue; }
     if (!item || typeof item !== "object") continue;
+
+    // Standard function_call (assistant tool call)
     if (item.type === "function_call") {
       const callId = item.call_id || item.id || ("call_" + Math.random().toString(36).slice(2, 10));
       const tc = {
@@ -1337,6 +1339,30 @@ function responsesInputToMessages(input, instructions) {
       }
       continue;
     }
+
+    // Codex v0.147 custom_tool_call = exec tool (assistant side)
+    if (item.type === "custom_tool_call") {
+      const callId = item.call_id || item.id || ("call_" + Math.random().toString(36).slice(2, 10));
+      // The `input` field holds raw JS code like: await tools.shell_command({ command: "..." });
+      // Surface it to the LLM as a function_call with name=exec and arguments=the JS string
+      const tc = {
+        id: callId,
+        type: "function",
+        function: {
+          name: item.name || "exec",
+          arguments: typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? ""),
+        },
+      };
+      const last = messages[messages.length - 1];
+      if (last && last.role === "assistant" && Array.isArray(last.tool_calls)) {
+        last.tool_calls.push(tc);
+      } else {
+        messages.push({ role: "assistant", content: null, tool_calls: [tc] });
+      }
+      continue;
+    }
+
+    // Standard function_call_output (tool result)
     if (item.type === "function_call_output") {
       messages.push({
         role: "tool",
@@ -1345,6 +1371,21 @@ function responsesInputToMessages(input, instructions) {
       });
       continue;
     }
+
+    // Codex v0.147 custom_tool_call_output = exec result
+    if (item.type === "custom_tool_call_output") {
+      // `output` contains stdout/stderr from the shell command
+      const outputText = typeof item.output === "string" ? item.output
+        : typeof item.output?.output === "string" ? item.output.output
+        : JSON.stringify(item.output ?? "");
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id || "",
+        content: outputText,
+      });
+      continue;
+    }
+
     if (item.type === "reasoning" || item.type === "item_reference") continue;
     const role = item.role || "user";
     const content = item.content;
