@@ -1850,22 +1850,33 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   };
 }
 
-function mapToolName(name) {
-  const n = (name || "").toLowerCase().trim();
-  if (n === "exec_command" || n === "bash" || n === "run_command" || n === "shell" || n === "terminal" || n === "cmd") return "exec";
-  if (n === "patch" || n === "edit_file" || n === "write_file") return "apply_patch";
-  if (n === "search" || n === "google_search" || n === "bing_search") return "web_search";
-  return name;
-}
+function sanitizeToolPayload(rawFnName, args, clientTools = []) {
+  let hasExecCommand = false;
+  let hasExec = false;
+  if (Array.isArray(clientTools)) {
+    for (const t of clientTools) {
+      const n = (t?.name || t?.function?.name || "").toLowerCase();
+      if (n === "exec_command") hasExecCommand = true;
+      if (n === "exec") hasExec = true;
+    }
+  }
 
-function sanitizeToolPayload(rawFnName, args) {
-  const fnName = mapToolName(rawFnName);
+  const n = (rawFnName || "").toLowerCase().trim();
+  let fnName = rawFnName;
+  if (n === "exec_command" || n === "exec" || n === "bash" || n === "run_command" || n === "shell" || n === "terminal" || n === "cmd") {
+    fnName = hasExecCommand ? "exec_command" : (hasExec ? "exec" : (n === "exec" ? "exec" : "exec_command"));
+  } else if (n === "patch" || n === "edit_file" || n === "write_file") {
+    fnName = "apply_patch";
+  } else if (n === "search" || n === "google_search" || n === "bing_search") {
+    fnName = "web_search";
+  }
+
   if (!args || typeof args !== "object") return { fnName, args };
   const clean = {};
-  if (fnName === "exec" || fnName === "shell_command") {
+  if (fnName === "exec" || fnName === "exec_command" || fnName === "shell_command") {
     clean.cmd = typeof args.cmd === "string" ? args.cmd : typeof args.command === "string" ? args.command : typeof args.input === "string" ? args.input : typeof args.code === "string" ? args.code : "";
     if (typeof args.workdir === "string" && args.workdir) clean.workdir = args.workdir;
-    return { fnName: "exec", args: clean };
+    return { fnName, args: clean };
   }
   if (fnName === "apply_patch") {
     clean.patch = typeof args.patch === "string" ? args.patch : typeof args.input === "string" ? args.input : "";
