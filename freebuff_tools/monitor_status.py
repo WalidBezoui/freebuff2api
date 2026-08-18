@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Freebuff Real-Time Account, US Cloud & Quota Monitor Dashboard
-Zero quota consumption.
+Freebuff Real-Time Account, US Cloud & Live Session Quota Monitor
+Zero quota consumption (uses read-only GET /session & /healthz).
 """
 
 import sys
@@ -24,12 +24,12 @@ CRED_FILE = Path(__file__).resolve().parent / "freebuff_credentials.json"
 REQUEST_TIMEOUT = 10
 
 SUPPORTED_MODELS = [
-    ("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", "UNLIMITED (US Cloud Tier) 🚀"),
-    ("mimo/mimo-v2.5",             "MiMo 2.5",          "UNLIMITED (US Cloud Tier) 🚀"),
-    ("deepseek/deepseek-v4-pro",   "DeepSeek V4 Pro",   "Frontier Reasoning (12h Pool) 💎"),
-    ("openai/gpt-5.6-luna",        "GPT-5.6 Luna",      "Flagship Coding (12h Pool) 💎"),
-    ("minimax/minimax-m3",         "MiniMax M3",        "Multilingual Coding 💎"),
-    ("z-ai/glm-5.2",               "GLM 5.2",           "High-Speed Reasoning 💎")
+    ("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", "Fastest Coding / High Reasoning"),
+    ("deepseek/deepseek-v4-pro",   "DeepSeek V4 Pro",   "Deepest Reasoning / Refactoring"),
+    ("openai/gpt-5.6-luna",        "GPT-5.6 Luna",      "OpenAI Flagship Coding Model"),
+    ("minimax/minimax-m3",         "MiniMax M3",        "Multilingual Code Reasoning"),
+    ("mimo/mimo-v2.5",             "MiMo 2.5",          "Fast Balanced Assistant"),
+    ("z-ai/glm-5.2",               "GLM 5.2",           "Z-AI High-Speed Reasoning")
 ]
 
 def clear_screen():
@@ -91,14 +91,18 @@ def evaluate_account(tok):
         return {
             "status_str": "Network Error ⚠️",
             "active_session": False,
-            "quota_info": f"Connection failed: {data.get('error')}",
+            "used": 0,
+            "limit": 6,
+            "rem": 0,
             "resets_at": None,
         }
     if status == 401:
         return {
-            "status_str": "Token Invalid ❌",
+            "status_str": "Token Expired ❌",
             "active_session": False,
-            "quota_info": "Unauthorized (authToken expired or revoked)",
+            "used": 0,
+            "limit": 6,
+            "rem": 0,
             "resets_at": None,
         }
     if status == 403:
@@ -106,38 +110,49 @@ def evaluate_account(tok):
         return {
             "status_str": "Banned ❌" if banned else "Access Denied (403)",
             "active_session": False,
-            "quota_info": "Account restricted or IP blocked",
+            "used": 6,
+            "limit": 6,
+            "rem": 0,
             "resets_at": None,
         }
     
     is_active = (status == 200 and isinstance(data, dict) and data.get("status") == "active")
     current_model = data.get("model", "None") if is_active else None
     
-    if is_active:
-        status_label = f"Healthy (Active Session: {current_model}) 🟢"
-    else:
-        status_label = "Healthy (Standby / Ready) ✅"
-    
     rate_limits = data.get("rateLimitsByModel") if isinstance(data, dict) else {}
+    used_count = 0.0
+    limit_count = 6.0
     earliest_reset = None
+    
     if isinstance(rate_limits, dict):
-        for _, info in rate_limits.items():
-            if isinstance(info, dict) and (info.get("resetAt") or info.get("reset_at")):
-                earliest_reset = info.get("resetAt") or info.get("reset_at")
+        for model_key in ["deepseek/deepseek-v4-flash", "mimo/mimo-v2.5"]:
+            info = rate_limits.get(model_key)
+            if isinstance(info, dict):
+                rc = info.get("recentCount", 0)
+                lim = info.get("limit", 6)
+                if isinstance(rc, (int, float)):
+                    used_count = float(rc)
+                if isinstance(lim, (int, float)):
+                    limit_count = float(lim)
+                if info.get("resetAt") or info.get("reset_at"):
+                    earliest_reset = info.get("resetAt") or info.get("reset_at")
                 break
 
-    quota_lines = [
-        "• deepseek/deepseek-v4-flash   : UNLIMITED in US Cloud Mode 🟢 (No Daily Cap)",
-        "• mimo/mimo-v2.5               : UNLIMITED in US Cloud Mode 🟢 (No Daily Cap)",
-        "• deepseek/deepseek-v4-pro     : 6 Daily Sessions (1h each) per Account 💎",
-        "• openai/gpt-5.6-luna          : 6 Daily Sessions (1h each) per Account 💎",
-        "• minimax/minimax-m3           : 6 Daily Sessions (1h each) per Account 💎",
-    ]
+    rem_sessions = max(0.0, round(limit_count - used_count, 1))
+    
+    if is_active:
+        status_label = f"Coding in Progress (Active: {current_model}) 🟢"
+    elif rem_sessions > 0:
+        status_label = "Available & Ready ✅"
+    else:
+        status_label = "Daily Cap Reached (Waiting for Reset) ⏳"
 
     return {
         "status_str": status_label,
         "active_session": is_active,
-        "quota_info": "\n      ".join(quota_lines),
+        "used": used_count,
+        "limit": limit_count,
+        "rem": rem_sessions,
         "resets_at": earliest_reset or "2026-08-19T07:00:00.000Z",
     }
 
@@ -156,29 +171,32 @@ def run_monitor(auto_refresh=True, interval=10):
         print(f" Auto-Refresh : Every {interval}s (Zero Quota Consumption)")
         print("==================================================================")
         
-        print("\n🚀 Ready & Available Models in Codex (/model):")
-        for slug, name, tier in SUPPORTED_MODELS:
-            print(f"  ✓ {slug:28} -> {name:18} | {tier}")
+        print("\n🚀 Ready Models in Codex (/model):")
+        for slug, name, desc in SUPPORTED_MODELS:
+            print(f"  ✓ {slug:28} -> {name:18} ({desc})")
         print("-" * 66)
         
         accounts = load_accounts()
+        total_remaining = 0.0
         if not accounts:
-            print("❌ No accounts found in local pool! Run 1-Login.bat to add an account.\n")
+            print("❌ No accounts found! Run 1-Login.bat to add an account.\n")
         else:
-            print(f"\n📊 Active Account Failover Pool ({len(accounts)} accounts configured):\n")
+            print(f"\n📊 Real-Time Account Session Pool ({len(accounts)} Accounts):\n")
             for idx, acct in enumerate(accounts, 1):
                 email = acct.get("email", "Unknown Email")
                 tok = acct.get("authToken", "")
                 tok_masked = tok[:8] + "..." + tok[-4:] if len(tok) > 12 else tok
                 res = evaluate_account(tok)
+                total_remaining += res["rem"]
                 
-                print(f"[{idx}] Account: {email}")
-                print(f"    Token  : {tok_masked}")
-                print(f"    Status : {res['status_str']}")
-                print(f"    Access & Quotas:\n      {res['quota_info']}")
-                if res["resets_at"]:
-                    print(f"    Reset  : {res['resets_at']}")
+                print(f"[{idx}] Account : {email}")
+                print(f"    Token   : {tok_masked}")
+                print(f"    Status  : {res['status_str']}")
+                print(f"    Sessions: {res['used']} / {res['limit']} used  -->  {res['rem']} sessions remaining")
+                print(f"    Reset At: {res['resets_at']}")
                 print("-" * 66)
+            
+            print(f"💡 Total Pool Capacity: {total_remaining} hours remaining across all accounts.")
         
         if not auto_refresh:
             break
