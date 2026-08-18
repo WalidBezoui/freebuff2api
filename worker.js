@@ -1110,8 +1110,10 @@ function normalizeReasoningEffort(model, effort) {
 function buildUpstreamPayload(params, mc, sess, runId) {
   const payload = {};
   for (const k of UPSTREAM_KEYS) if (params[k] !== undefined && params[k] !== null) payload[k] = params[k];
+  delete payload.reasoning;
   // reasoning_effort 按官方模型 efforts 表 clamp-down（不拒绝、不换模型）
-  if (payload.reasoning_effort !== undefined) {
+  if (payload.reasoning_effort !== undefined && payload.reasoning_effort !== null) {
+    if (payload.reasoning_effort === "ultra") payload.reasoning_effort = "max";
     payload.reasoning_effort = normalizeReasoningEffort(mc.id, payload.reasoning_effort);
   }
   payload.model = mc.upstream;
