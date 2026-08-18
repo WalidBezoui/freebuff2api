@@ -1863,11 +1863,13 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
 function sanitizeToolPayload(rawFnName, args, clientTools = []) {
   let hasExecCommand = false;
   let hasExec = false;
+  let hasShellCommand = false;
   if (Array.isArray(clientTools)) {
     for (const t of clientTools) {
       const n = (t?.name || t?.function?.name || "").toLowerCase();
       if (n === "exec_command") hasExecCommand = true;
       if (n === "exec") hasExec = true;
+      if (n === "shell_command") hasShellCommand = true;
     }
   }
 
@@ -1878,7 +1880,9 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
     n === "functions.exec" || n === "shell_command";
 
   if (isExecLike) {
-    if (hasExecCommand && !hasExec) {
+    if (hasShellCommand && !hasExec) {
+      fnName = "shell_command";
+    } else if (hasExecCommand && !hasExec) {
       fnName = "exec_command";
     } else {
       fnName = "exec";
@@ -1889,19 +1893,29 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
     fnName = "web_search";
   }
 
+  const cmdVal = typeof args === "string" ? args
+    : typeof args?.command === "string" ? args.command
+    : typeof args?.cmd === "string" ? args.cmd
+    : typeof args?.input === "string" ? args.input
+    : typeof args?.code === "string" ? args.code
+    : "";
+
+  if (fnName === "exec") {
+    if (/^\s*(await\s+tools\.|tools\.|const\s+|let\s+|\/\/\s*@exec)/.test(cmdVal)) {
+      return { fnName: "exec", args: cmdVal };
+    }
+    return { fnName: "exec", args: `await tools.shell_command({ command: ${JSON.stringify(cmdVal)} });` };
+  }
+
   if (!args || typeof args !== "object") return { fnName, args };
   const clean = {};
-  if (isExecLike || fnName === "exec" || fnName === "exec_command" || fnName === "shell_command") {
-    const cmdVal = typeof args.command === "string" ? args.command
-      : typeof args.cmd === "string" ? args.cmd
-      : typeof args.input === "string" ? args.input
-      : typeof args.code === "string" ? args.code
-      : "";
-    if (fnName === "exec_command") {
-      clean.cmd = cmdVal;
-    } else {
-      clean.command = cmdVal;
-    }
+  if (fnName === "exec_command") {
+    clean.cmd = cmdVal;
+    if (typeof args.workdir === "string" && args.workdir) clean.workdir = args.workdir;
+    return { fnName, args: clean };
+  }
+  if (fnName === "shell_command") {
+    clean.command = cmdVal;
     if (typeof args.workdir === "string" && args.workdir) clean.workdir = args.workdir;
     return { fnName, args: clean };
   }
@@ -2142,7 +2156,7 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
     toolCalls.push({
       id: "call_" + Math.random().toString(36).slice(2, 10),
       name: sanitized.fnName,
-      arguments: JSON.stringify(sanitized.args)
+      arguments: typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args)
     });
   }
 
@@ -2177,7 +2191,7 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
     toolCalls.push({
       id: "call_" + Math.random().toString(36).slice(2, 10),
       name: sanitized.fnName,
-      arguments: JSON.stringify(sanitized.args)
+      arguments: typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args)
     });
   }
 
@@ -2408,14 +2422,14 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         } else {
           let cleanArgs = item.args;
           try {
-            const rawObj = typeof item.args === "string" ? JSON.parse(item.args) : (item.args || {});
+            const rawObj = typeof item.args === "string" ? (item.args.startsWith("{") ? JSON.parse(item.args) : item.args) : (item.args || {});
             const sanitized = sanitizeToolPayload(item.name, rawObj, clientTools);
             item.name = sanitized.fnName;
-            cleanArgs = JSON.stringify(sanitized.args);
+            cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
           } catch {
-            const sanitized = sanitizeToolPayload(item.name, { cmd: item.args }, clientTools);
+            const sanitized = sanitizeToolPayload(item.name, { command: item.args }, clientTools);
             item.name = sanitized.fnName;
-            cleanArgs = JSON.stringify(sanitized.args);
+            cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
           }
           item.args = cleanArgs;
           if (!item.started) {
