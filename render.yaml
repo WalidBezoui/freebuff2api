@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: freebuff2api
+    env: node
+    region: oregon # US West (Oregon) - Free US Egress
+    plan: free
+    buildCommand: ""
+    startCommand: "node server.js"
+    envVars:
+      - key: FREEBUFF_API_KEY
+        value: freebuff-default-key
+      - key: FREEBUFF_TOKEN
+        sync: false # Set in Render Dashboard

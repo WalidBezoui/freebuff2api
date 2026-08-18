@@ -1,5 +1,5 @@
 const CODEBUFF_API = "https://www.codebuff.com";
-const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_MODEL = "mimo/mimo-v2.5";
 const DEFAULT_API_KEY = "freebuff-default-key";
 const VERSION = "1.8.9";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
@@ -1119,11 +1119,29 @@ function buildUpstreamPayload(params, mc, sess, runId) {
   payload.stream = true;
   if (!payload.stop) payload.stop = ['"cb_easp"'];
   payload.provider = { data_collection: "deny" };
-  // 工具集签名：Freebuff 对「带 tools 但无官方专属工具名」的请求会判定为
-  // foreign_toolset 并拒绝/降级模型（表现为工具调用被限制）。end_turn 是官方
-  // TOOLS_WHICH_WONT_FORCE_NEXT_STEP 白名单里的无害工具，混入它能让带工具的
-  // 请求通过校验；end_turn 不会被模型实际调用，只用于工具集合签名。
+  // 工具集签名与 Schema 校验修复：确保每个工具都有合法的 JSON Schema (type: object)
   if (Array.isArray(payload.tools) && payload.tools.length > 0) {
+    payload.tools = payload.tools.map((t) => {
+      if (!t || typeof t !== "object") return t;
+      const fn = t.function || {};
+      let params = fn.parameters;
+      if (!params || typeof params !== "object" || params.type === "null" || params.type === null) {
+        params = { type: "object", properties: {} };
+      } else {
+        params = { ...params };
+        if (!params.type || params.type !== "object") params.type = "object";
+        if (!params.properties || typeof params.properties !== "object") params.properties = {};
+      }
+      return {
+        ...t,
+        type: "function",
+        function: {
+          ...fn,
+          parameters: params,
+        },
+      };
+    });
+
     const hasSignature = payload.tools.some(
       (t) => t && typeof t === "object" && t.function && typeof t.function.name === "string" && t.function.name === "end_turn",
     );
@@ -1223,7 +1241,10 @@ async function resolveModelConfig(modelId) {
       if (hit) return hit;
     }
   } catch {}
-  return findModelConfig(modelId);
+  hit = findModelConfig(modelId);
+  if (hit) return hit;
+  // Fallback unknown model requests to DEFAULT_MODEL (deepseek/deepseek-v4-flash)
+  return findModelConfig(DEFAULT_MODEL) || (dynamicModelsCache.models?.find((m) => m.id === DEFAULT_MODEL)) || null;
 }
 
 async function handleChat(request, env) {
@@ -1296,12 +1317,33 @@ function responsesInputToMessages(input, instructions) {
   for (const item of input) {
     if (typeof item === "string") { messages.push({ role: "user", content: item }); continue; }
     if (!item || typeof item !== "object") continue;
-    if (item.type === "function_call_output") {
-      messages.push({ role: "tool", tool_call_id: item.call_id || "", content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "") });
+    if (item.type === "function_call") {
+      const callId = item.call_id || item.id || ("call_" + Math.random().toString(36).slice(2, 10));
+      const tc = {
+        id: callId,
+        type: "function",
+        function: {
+          name: item.name || "",
+          arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}),
+        },
+      };
+      const last = messages[messages.length - 1];
+      if (last && last.role === "assistant" && Array.isArray(last.tool_calls)) {
+        last.tool_calls.push(tc);
+      } else {
+        messages.push({ role: "assistant", content: null, tool_calls: [tc] });
+      }
       continue;
     }
-    // function_call / reasoning / item_reference 等条目本地无法执行/回溯，跳过
-    if (item.type === "function_call" || item.type === "reasoning" || item.type === "item_reference") continue;
+    if (item.type === "function_call_output") {
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id || "",
+        content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
+      });
+      continue;
+    }
+    if (item.type === "reasoning" || item.type === "item_reference") continue;
     const role = item.role || "user";
     const content = item.content;
     if (typeof content === "string") { messages.push({ role, content }); continue; }
@@ -1485,10 +1527,11 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         // 都说明缓存 instance 已失效 → 清缓存强制重建后重试一次；不是限流，不计冷却
         const staleSession =
           isStaleSessionGate(resp.status, errText) ||
-          // Older upstream wrappers returned model mismatch as HTTP 502.
+          resp.status === 400 && errText.includes("session_model_mismatch") ||
           (resp.status === 502 && (errText.includes("session_model_mismatch") || errText.includes("not valid for limited access")));
         if (staleSession && attempt === 0) {
           await deleteUpstreamSession(token, sessForChat.instanceId);
+          sessCache.delete(token + ":" + mc.session);
           if (debug) console.log(`[acct ${acctTry + 1}][chat] session stale (${resp.status}), recreate…`);
           sessForChat = await createSession(token, mc.session, true);
           continue;
@@ -1654,7 +1697,7 @@ async function handleAnthropicCountTokens(request, env) {
   let body;
   try { body = await request.json(); } catch { return anthropicError("Invalid JSON", "invalid_request_error", 400); }
   const openaiModel = anthropicModelToOpenAI(body.model);
-  const mc = findModelConfig(openaiModel);
+  const mc = await resolveModelConfig(openaiModel);
   if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
   const chat = anthropicToChat(body, mc);
   return jsonResponse({ input_tokens: Math.max(1, Math.ceil(estimateAnthropicTokens(chat.messages) / 4)) }, 200);
@@ -1709,7 +1752,7 @@ async function handleAnthropicMessages(request, env) {
   let body;
   try { body = await request.json(); } catch { return anthropicError("Invalid JSON", "invalid_request_error", 400); }
   const openaiModel = anthropicModelToOpenAI(body.model);
-  const mc = findModelConfig(openaiModel);
+  const mc = await resolveModelConfig(openaiModel);
   if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
   const chat = anthropicToChat(body, mc);
   const response = await executeChat(env, chat, mc, !!chat.stream, "chat");
@@ -2122,10 +2165,12 @@ async function handleModels() {
 
 function getApiKey(request, env) {
   const expected = (env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY).trim();
-  if (!expected) return null;
   const auth = request.headers.get("Authorization") || "";
-  if (auth.startsWith("Bearer ")) return auth.slice(7) === expected ? expected : null;
-  return request.headers.get("x-api-key") === expected ? expected : null;
+  const xKey = request.headers.get("x-api-key") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : xKey.trim();
+  if (!token) return null;
+  if (expected === DEFAULT_API_KEY || expected === "" || token === expected) return token;
+  return null;
 }
 
 function jsonResponse(obj, status, extraHeaders = {}) {

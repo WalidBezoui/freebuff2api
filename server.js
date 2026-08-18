@@ -27,6 +27,27 @@ if (existsSync(credDir)) {
   }
 }
 
+// Also read from freebuff_tools/freebuff_credentials.json
+const toolCredFile = resolve(__dirname, 'freebuff_tools', 'freebuff_credentials.json');
+if (existsSync(toolCredFile)) {
+  try {
+    const raw = readFileSync(toolCredFile, 'utf-8');
+    const obj = JSON.parse(raw);
+    if (obj.default && obj.default.authToken) {
+      const t = obj.default.authToken.trim();
+      if (!tokenLines.includes(t)) tokenLines.push(t);
+    }
+    if (obj.accounts && typeof obj.accounts === 'object') {
+      for (const k of Object.keys(obj.accounts)) {
+        const tok = obj.accounts[k]?.authToken?.trim();
+        if (tok && !tokenLines.includes(tok)) tokenLines.push(tok);
+      }
+    }
+  } catch (err) {
+    console.error(`[server] skip freebuff_credentials.json: ${err.message}`);
+  }
+}
+
 // Also allow FREEBUFF_TOKEN env var for non-credential token sources
 const envToken = process.env.FREEBUFF_TOKEN || '';
 if (envToken) {
