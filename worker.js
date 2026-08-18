@@ -1863,6 +1863,10 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
 }
 
 function sanitizeToolPayload(rawFnName, args, clientTools = []) {
+  // Detect which exec tool name Codex registered in this session.
+  // Codex v0.147 registers "exec" (with field "command").
+  // Older builds registered "exec_command" (with field "cmd").
+  // Default: prefer "exec"/"command" unless the client explicitly lists "exec_command".
   let hasExecCommand = false;
   let hasExec = false;
   if (Array.isArray(clientTools)) {
@@ -1875,8 +1879,18 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
 
   const n = (rawFnName || "").toLowerCase().trim();
   let fnName = rawFnName;
-  if (n === "exec_command" || n === "exec" || n === "bash" || n === "run_command" || n === "shell" || n === "terminal" || n === "cmd") {
-    fnName = hasExecCommand ? "exec_command" : (hasExec ? "exec" : (n === "exec" ? "exec" : "exec_command"));
+  const isExecLike = n === "exec_command" || n === "exec" || n === "bash" ||
+    n === "run_command" || n === "shell" || n === "terminal" || n === "cmd" ||
+    n === "functions.exec" || n === "shell_command";
+
+  if (isExecLike) {
+    // Prefer exec_command only if client explicitly listed it and NOT exec
+    if (hasExecCommand && !hasExec) {
+      fnName = "exec_command";
+    } else {
+      // Default: "exec" (Codex v0.147 standard)
+      fnName = "exec";
+    }
   } else if (n === "patch" || n === "edit_file" || n === "write_file") {
     fnName = "apply_patch";
   } else if (n === "search" || n === "google_search" || n === "bing_search") {
@@ -1885,8 +1899,20 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
 
   if (!args || typeof args !== "object") return { fnName, args };
   const clean = {};
-  if (fnName === "exec" || fnName === "exec_command" || fnName === "shell_command") {
-    clean.cmd = typeof args.cmd === "string" ? args.cmd : typeof args.command === "string" ? args.command : typeof args.input === "string" ? args.input : typeof args.code === "string" ? args.code : "";
+  if (isExecLike || fnName === "exec" || fnName === "exec_command" || fnName === "shell_command") {
+    // Extract the command string from whichever field the model used
+    const cmdVal = typeof args.command === "string" ? args.command
+      : typeof args.cmd === "string" ? args.cmd
+      : typeof args.input === "string" ? args.input
+      : typeof args.code === "string" ? args.code
+      : "";
+    // Emit the correct field name for the registered tool
+    if (fnName === "exec_command") {
+      clean.cmd = cmdVal;
+    } else {
+      // exec (Codex v0.147) expects "command"
+      clean.command = cmdVal;
+    }
     if (typeof args.workdir === "string" && args.workdir) clean.workdir = args.workdir;
     return { fnName, args: clean };
   }
