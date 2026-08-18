@@ -1297,21 +1297,21 @@ function responsesToChatParams(params, mc) {
     chat.tools = params.tools
       .filter((t) => t && typeof t === "object")
       .map((t) => {
-        if (t.type === "function" && t.function) return t;
-        const name = t.name || (t.type === "custom" || t.type === "local_shell" ? "exec" : "");
-        const desc = t.description || "";
-        const paramsSchema = t.parameters || t.input_schema || {
+        const rawName = t.name || (t.type === "custom" || t.type === "local_shell" ? "exec_command" : "");
+        const name = rawName === "exec" ? "exec_command" : (rawName || "exec_command");
+        const desc = t.description || "Execute a shell command";
+        const paramsSchema = {
           type: "object",
           properties: {
-            command: { type: "string", description: "The command to execute" },
-            cmd: { type: "string", description: "The command to execute" }
+            cmd: { type: "string", description: "The command to execute" },
+            command: { type: "string", description: "The command to execute" }
           },
-          required: ["command"]
+          required: ["cmd"]
         };
         return {
           type: "function",
           function: {
-            name: name || "exec",
+            name,
             description: desc,
             parameters: paramsSchema,
           },
@@ -1322,7 +1322,8 @@ function responsesToChatParams(params, mc) {
   // Responses tool_choice → chat 格式；仅支持 function 类型，其它对象形式退回 auto
   if (params.tool_choice && typeof params.tool_choice === "object") {
     if (params.tool_choice.type === "function" && params.tool_choice.name) {
-      chat.tool_choice = { type: "function", function: { name: params.tool_choice.name } };
+      const fnName = params.tool_choice.name === "exec" ? "exec_command" : params.tool_choice.name;
+      chat.tool_choice = { type: "function", function: { name: fnName } };
     } else {
       chat.tool_choice = "auto";
     }
@@ -1345,11 +1346,12 @@ function responsesInputToMessages(input, instructions) {
     // Standard function_call (assistant tool call)
     if (item.type === "function_call") {
       const callId = item.call_id || item.id || ("call_" + Math.random().toString(36).slice(2, 10));
+      const fnName = item.name === "exec" ? "exec_command" : (item.name || "exec_command");
       const tc = {
         id: callId,
         type: "function",
         function: {
-          name: item.name || "",
+          name: fnName,
           arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}),
         },
       };
@@ -1365,7 +1367,7 @@ function responsesInputToMessages(input, instructions) {
     // Codex v0.147 custom_tool_call = exec tool (assistant side)
     if (item.type === "custom_tool_call") {
       const callId = item.call_id || item.id || ("call_" + Math.random().toString(36).slice(2, 10));
-      // Extract command string if JS wrapper is present, ensuring valid JSON arguments for upstream LLM
+      // Extract command string if JS wrapper is present, ensuring valid JSON arguments with cmd field for upstream LLM
       let cmdString = "";
       if (typeof item.input === "string") {
         const m = /command\s*:\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/.exec(item.input);
@@ -1379,12 +1381,12 @@ function responsesInputToMessages(input, instructions) {
           cmdString = item.input;
         }
       }
-      const argsPayload = cmdString ? JSON.stringify({ command: cmdString, cmd: cmdString }) : (typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? {}));
+      const argsPayload = JSON.stringify({ cmd: cmdString, command: cmdString });
       const tc = {
         id: callId,
         type: "function",
         function: {
-          name: item.name || "exec",
+          name: "exec_command",
           arguments: argsPayload,
         },
       };
@@ -1399,25 +1401,18 @@ function responsesInputToMessages(input, instructions) {
 
     // Standard function_call_output (tool result)
     if (item.type === "function_call_output") {
+      const textOut = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "");
       messages.push({
         role: "tool",
+        name: "exec_command",
         tool_call_id: item.call_id || "",
-        content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
+        content: textOut || "(command completed with no output)",
       });
       continue;
     }
 
     // Codex v0.147 custom_tool_call_output = exec result
     if (item.type === "custom_tool_call_output") {
-      // DEBUG: log the full item to discover the real wire format
-      // This console.error appears in Vercel function logs
-      console.error("[DEBUG custom_tool_call_output] keys=" + JSON.stringify(Object.keys(item)) +
-        " output_type=" + typeof item.output +
-        " content_type=" + typeof item.content +
-        " text_type=" + typeof item.text +
-        " result_type=" + typeof item.result +
-        " item=" + JSON.stringify(item).slice(0, 500));
-
       // Try every plausible field name used by Codex/OpenAI for tool results
       let outputText = "";
       if (typeof item.output === "string") {
@@ -1427,7 +1422,6 @@ function responsesInputToMessages(input, instructions) {
       } else if (typeof item.output?.text === "string") {
         outputText = item.output.text;
       } else if (Array.isArray(item.output)) {
-        // Array of content parts [{type:"text",text:"..."}]
         outputText = item.output.map(p => typeof p === "string" ? p : (p?.text || p?.content || "")).join("");
       } else if (typeof item.content === "string") {
         outputText = item.content;
@@ -1442,8 +1436,9 @@ function responsesInputToMessages(input, instructions) {
       }
       messages.push({
         role: "tool",
+        name: "exec_command",
         tool_call_id: item.call_id || "",
-        content: outputText,
+        content: outputText || "(command completed with no output)",
       });
       continue;
     }
