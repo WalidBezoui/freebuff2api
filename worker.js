@@ -1845,11 +1845,63 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   return {
     id: id || "gen_" + Date.now(),
     object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model: model || upstreamModel,
     choices: [{ index: 0, message: msg, finish_reason: finishReason || "stop", logprobs: null }],
     usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
+}
+
+function parseXmlToolCallsAndCommentary(rawText) {
+  if (!rawText || typeof rawText !== "string") return { cleanedText: rawText || "", commentary: "", toolCalls: [] };
+  let cleanedText = rawText;
+  const toolCalls = [];
+  const commentaryParts = [];
+
+  const commentaryRegex = /<textarea\s+placeholder=["']commentary["']>([\s\S]*?)<\/textarea>|<commentary>([\s\S]*?)<\/commentary>|<thought>([\s\S]*?)<\/thought>|<thinking>([\s\S]*?)<\/thinking>/gi;
+  cleanedText = cleanedText.replace(commentaryRegex, (match, p1, p2, p3, p4) => {
+    const text = (p1 || p2 || p3 || p4 || "").trim();
+    if (text) commentaryParts.push(text);
+    return "";
+  });
+
+  const invokeRegex = /<invoke\s+name=["']([^"']+)["']>([\s\S]*?)<\/invoke>/gi;
+  let match;
+  while ((match = invokeRegex.exec(cleanedText)) !== null) {
+    const fnName = match[1].trim();
+    const body = match[2];
+    const args = {};
+    const paramRegex = /<parameter\s+name=["']([^"']+)["']>([\s\S]*?)<\/parameter>/gi;
+    let pMatch;
+    let hasParams = false;
+    while ((pMatch = paramRegex.exec(body)) !== null) {
+      hasParams = true;
+      const pName = pMatch[1].trim();
+      let pVal = pMatch[2].trim();
+      try { pVal = JSON.parse(pVal); } catch {}
+      args[pName] = pVal;
+    }
+    if (!hasParams) {
+      try {
+        const parsed = JSON.parse(body.trim());
+        if (typeof parsed === "object" && parsed !== null) Object.assign(args, parsed);
+        else args["cmd"] = body.trim();
+      } catch {
+        if (body.trim()) args["cmd"] = body.trim();
+      }
+    }
+    toolCalls.push({
+      id: "call_" + Math.random().toString(36).slice(2, 10),
+      name: fnName,
+      arguments: JSON.stringify(args)
+    });
+  }
+
+  cleanedText = cleanedText
+    .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/gi, "")
+    .replace(/<invoke\s+name=["'][^"']+["']>[\s\S]*?<\/invoke>/gi, "")
+    .replace(/<\/?(?:tool_calls|invoke|parameter|textarea)>/gi, "")
+    .trim();
+
+  return { cleanedText, commentary: commentaryParts.join("\n\n"), toolCalls };
 }
 
 // ---------------------------------------------------------------------------
@@ -2023,8 +2075,40 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         await send({ type: "response.content_part.added", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
       }
 
-      // 收尾：按出现顺序输出每个输出项的 done 事件
+      // 收尾：检查是否有 message item 包含 XML tool calls 或 commentary
+      const finalItems = [];
       for (const item of items) {
+        if (item.kind === "message" && item.text) {
+          const parsed = parseXmlToolCallsAndCommentary(item.text);
+          if (parsed.toolCalls && parsed.toolCalls.length > 0) {
+            const remainingText = parsed.cleanedText || parsed.commentary;
+            if (remainingText) {
+              item.text = remainingText;
+              finalItems.push(item);
+            }
+            for (const tc of parsed.toolCalls) {
+              const tcItem = {
+                kind: "function_call",
+                id: "fc_" + Math.random().toString(36).slice(2, 10),
+                outputIndex: nextOutputIndex++,
+                callId: tc.id,
+                name: tc.name,
+                args: tc.arguments,
+              };
+              await send({ type: "response.output_item.added", output_index: tcItem.outputIndex, item: { id: tcItem.id, type: "function_call", status: "in_progress", call_id: tcItem.callId, name: tcItem.name, arguments: "" } });
+              await send({ type: "response.function_call_arguments.delta", item_id: tcItem.id, output_index: tcItem.outputIndex, delta: tcItem.args });
+              finalItems.push(tcItem);
+            }
+            continue;
+          } else if (parsed.cleanedText !== item.text) {
+            item.text = parsed.cleanedText || parsed.commentary;
+          }
+        }
+        finalItems.push(item);
+      }
+
+      // 按出现顺序输出每个输出项的 done 事件
+      for (const item of finalItems) {
         if (item.kind === "message") {
           if (!item.started) {
             await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
@@ -2042,7 +2126,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       const resp = responsesBase(mc, respId, createdAt);
       resp.status = "completed";
       resp.model = model || mc.id;
-      resp.output = items.map((item) =>
+      resp.output = finalItems.map((item) =>
         item.kind === "message"
           ? { id: item.id, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: item.text, annotations: [] }] }
           : { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args }
@@ -2110,12 +2194,26 @@ async function responsesToNonStream(upstreamBody, mc) {
   resp.model = model || mc.id;
   resp.output = [];
   if (outputText || reasoning) {
-    const text = outputText || reasoning;
-    resp.output.push({
-      id: "msg_" + Math.random().toString(36).slice(2, 10),
-      type: "message", status: "completed", role: "assistant",
-      content: [{ type: "output_text", text, annotations: [] }],
-    });
+    const raw = outputText || reasoning;
+    const parsed = parseXmlToolCallsAndCommentary(raw);
+    const text = parsed.cleanedText || parsed.commentary;
+    if (text) {
+      resp.output.push({
+        id: "msg_" + Math.random().toString(36).slice(2, 10),
+        type: "message", status: "completed", role: "assistant",
+        content: [{ type: "output_text", text, annotations: [] }],
+      });
+    }
+    for (const tc of parsed.toolCalls) {
+      resp.output.push({
+        id: "fc_" + Math.random().toString(36).slice(2, 10),
+        type: "function_call",
+        status: "completed",
+        call_id: tc.id,
+        name: tc.name,
+        arguments: tc.arguments,
+      });
+    }
   }
   for (const item of toolItems.values()) {
     resp.output.push({ id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args });
