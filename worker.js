@@ -323,6 +323,16 @@ function modelPoolCategory(modelId) {
 // 其余模型全部由动态拉取提供（官方源 → GitHub Releases JSON → 这个兜底）
 const MODELS = [
   { id: "mimo/mimo-v2.5", session: "mimo/mimo-v2.5", agent: "base2-free-mimo", upstream: "mimo/mimo-v2.5" },
+  { id: "deepseek/deepseek-v4-flash", session: "deepseek/deepseek-v4-flash", agent: "base2-free-deepseek-flash", upstream: "deepseek/deepseek-v4-flash" },
+  { id: "deepseek/deepseek-v4-pro", session: "deepseek/deepseek-v4-pro", agent: "base2-free-deepseek", upstream: "deepseek/deepseek-v4-pro" },
+  { id: "openai/gpt-5.6-luna", session: "openai/gpt-5.6-luna", agent: "base2-free-luna", upstream: "openai/gpt-5.6-luna" },
+  { id: "minimax/minimax-m3", session: "minimax/minimax-m3", agent: "base2-free-minimax-m3", upstream: "minimax/minimax-m3" },
+  { id: "z-ai/glm-5.2", session: "z-ai/glm-5.2", agent: "base2-free-glm", upstream: "z-ai/glm-5.2" },
+  { id: "poolside/laguna-s-2.1", session: "poolside/laguna-s-2.1", agent: "base2-free-laguna-s-2-1", upstream: "poolside/laguna-s-2.1" },
+  { id: "openrouter/poolside/laguna-s-2.1", session: "openrouter/poolside/laguna-s-2.1", agent: "base2-free-laguna-s-2-1-openrouter", upstream: "openrouter/poolside/laguna-s-2.1" },
+  { id: "crof/kimi-k3-eco", session: "crof/kimi-k3-eco", agent: "base2-free-kimi-k3-eco", upstream: "crof/kimi-k3-eco" },
+  { id: "anthropic/claude-fable-5", session: "anthropic/claude-fable-5", agent: "base2-free-fable", upstream: "anthropic/claude-fable-5" },
+  { id: "meta/muse-spark-1.2-contributor", session: "meta/muse-spark-1.2-contributor", agent: "base2-free-muse-spark", upstream: "meta/muse-spark-1.2-contributor" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -927,7 +937,7 @@ async function createSession(token, sessionModel, forceCreate = false) {
     });
     if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
       const cm = cur.data.model;
-      if (!cm || cm === sessionModel) {
+      if (cm === sessionModel) {
         const s = normalizeSession(cur.data, sessionModel);
         sessCache.set(token + ":" + sessionModel, s);
         return s;
@@ -1282,19 +1292,31 @@ function responsesToChatParams(params, mc) {
     chat.response_format = { type: params.text.format.type };
     if (params.text.format.json_schema) chat.response_format.json_schema = params.text.format.json_schema;
   }
-  // Responses 工具格式（扁平 function）→ chat completions 格式（function 包装）。
-  // 上游只接受 type:"function"，namespace/web_search 等非 function 工具一律过滤，避免反序列化报错。
+  // Responses 工具格式（扁平 function/custom）→ chat completions 格式（function 包装）。
   if (Array.isArray(params.tools)) {
     chat.tools = params.tools
-      .filter((t) => t && typeof t === "object" && t.type === "function")
-      .map((t) => ({
-        type: "function",
-        function: {
-          name: t.name || "",
-          description: t.description || "",
-          parameters: t.parameters || { type: "object", properties: {} },
-        },
-      }));
+      .filter((t) => t && typeof t === "object")
+      .map((t) => {
+        if (t.type === "function" && t.function) return t;
+        const name = t.name || (t.type === "custom" || t.type === "local_shell" ? "exec" : "");
+        const desc = t.description || "";
+        const paramsSchema = t.parameters || t.input_schema || {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "The command to execute" },
+            cmd: { type: "string", description: "The command to execute" }
+          },
+          required: ["command"]
+        };
+        return {
+          type: "function",
+          function: {
+            name: name || "exec",
+            description: desc,
+            parameters: paramsSchema,
+          },
+        };
+      });
     if (chat.tools.length === 0) delete chat.tools;
   }
   // Responses tool_choice → chat 格式；仅支持 function 类型，其它对象形式退回 auto
@@ -1343,14 +1365,27 @@ function responsesInputToMessages(input, instructions) {
     // Codex v0.147 custom_tool_call = exec tool (assistant side)
     if (item.type === "custom_tool_call") {
       const callId = item.call_id || item.id || ("call_" + Math.random().toString(36).slice(2, 10));
-      // The `input` field holds raw JS code like: await tools.shell_command({ command: "..." });
-      // Surface it to the LLM as a function_call with name=exec and arguments=the JS string
+      // Extract command string if JS wrapper is present, ensuring valid JSON arguments for upstream LLM
+      let cmdString = "";
+      if (typeof item.input === "string") {
+        const m = /command\s*:\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/.exec(item.input);
+        if (m) {
+          try {
+            cmdString = JSON.parse(`"${m[2]}"`);
+          } catch {
+            cmdString = m[2];
+          }
+        } else {
+          cmdString = item.input;
+        }
+      }
+      const argsPayload = cmdString ? JSON.stringify({ command: cmdString, cmd: cmdString }) : (typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? {}));
       const tc = {
         id: callId,
         type: "function",
         function: {
           name: item.name || "exec",
-          arguments: typeof item.input === "string" ? item.input : JSON.stringify(item.input ?? ""),
+          arguments: argsPayload,
         },
       };
       const last = messages[messages.length - 1];
