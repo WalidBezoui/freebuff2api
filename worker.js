@@ -1918,7 +1918,6 @@ function getVisibleCleanText(rawText) {
 function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
   if (!rawText || typeof rawText !== "string") return { cleanedText: rawText || "", commentary: "", toolCalls: [] };
   
-  // Normalize DSML / special unicode tags (e.g. <｜｜DSML｜｜invoke ...>)
   let cleanedText = rawText.replace(/<\/?(?:[^\w\s<>]*DSML[^\w\s<>]*)?([a-zA-Z_]+)/gi, (m, tag) => {
     return m.startsWith("</") ? `</${tag}` : `<${tag}`;
   });
@@ -1933,7 +1932,6 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
     return "";
   });
 
-  // Support both <invoke name="..."> and <tool_call name="...">
   const invokeRegex = /<(?:invoke|tool_call)\s+name=["']([^"']+)["']>([\s\S]*?)<\/(?:invoke|tool_call)>/gi;
   let match;
   while ((match = invokeRegex.exec(cleanedText)) !== null) {
@@ -1977,10 +1975,6 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
   return { cleanedText, commentary: commentaryParts.join("\n\n"), toolCalls };
 }
 
-// ---------------------------------------------------------------------------
-// Responses API（/v1/responses）输出
-// ---------------------------------------------------------------------------
-
 function responsesBase(mc, respId, createdAt) {
   return {
     id: respId || "resp_" + Math.random().toString(36).slice(2, 10),
@@ -2013,8 +2007,6 @@ function responsesUsage() {
   return { input_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens: 0, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 0 };
 }
 
-// 上游是 Chat Completions 格式，Responses API 要求 input/output_tokens。
-// 统一归一化，避免把不完整或错误格式的 usage 直接透传给严格客户端。
 function chatUsageToResponsesUsage(usage) {
   if (!usage || typeof usage !== "object") return responsesUsage();
   const inputTokens = Number.isFinite(usage.input_tokens)
@@ -2038,7 +2030,6 @@ function chatUsageToResponsesUsage(usage) {
     total_tokens: totalTokens,
   };
 }
-
 // 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
 async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete, clientTools = []) {
   const reader = upstreamBody.getReader();
@@ -2054,18 +2045,6 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
   let rawTextAccumulator = "";
   let alreadyEmittedCleanLength = 0;
   const nativeToolItems = new Map(); // 上游原生 tool_calls index → {id, callId, name, args}
-
-  const startContent = () => {
-    const item = {
-      kind: "message",
-      id: "msg_" + Math.random().toString(36).slice(2, 10),
-      outputIndex: 0,
-      text: "",
-      contentIndex: 0,
-      started: false,
-    };
-    return item;
-  };
 
   (async () => {
     try {
@@ -2095,11 +2074,17 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
               for (const tc of delta.tool_calls) {
                 if (!tc || typeof tc !== "object") continue;
                 const ti = tc.index ?? 0;
-                let item = toolItems.get(ti);
+                let item = nativeToolItems.get(ti);
                 if (!item) {
-                  item = startTool(tc);
-                  toolItems.set(ti, item);
-                  await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" } });
+                  item = {
+                    kind: "function_call",
+                    id: "fc_" + Math.random().toString(36).slice(2, 10),
+                    callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
+                    name: tc.function?.name || "",
+                    args: "",
+                    started: false,
+                  };
+                  nativeToolItems.set(ti, item);
                 }
                 const fn = tc.function || {};
                 if (fn.name && !item.name) item.name = fn.name;
