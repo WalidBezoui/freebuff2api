@@ -1374,10 +1374,37 @@ function responsesInputToMessages(input, instructions) {
 
     // Codex v0.147 custom_tool_call_output = exec result
     if (item.type === "custom_tool_call_output") {
-      // `output` contains stdout/stderr from the shell command
-      const outputText = typeof item.output === "string" ? item.output
-        : typeof item.output?.output === "string" ? item.output.output
-        : JSON.stringify(item.output ?? "");
+      // DEBUG: log the full item to discover the real wire format
+      // This console.error appears in Vercel function logs
+      console.error("[DEBUG custom_tool_call_output] keys=" + JSON.stringify(Object.keys(item)) +
+        " output_type=" + typeof item.output +
+        " content_type=" + typeof item.content +
+        " text_type=" + typeof item.text +
+        " result_type=" + typeof item.result +
+        " item=" + JSON.stringify(item).slice(0, 500));
+
+      // Try every plausible field name used by Codex/OpenAI for tool results
+      let outputText = "";
+      if (typeof item.output === "string") {
+        outputText = item.output;
+      } else if (typeof item.output?.output === "string") {
+        outputText = item.output.output;
+      } else if (typeof item.output?.text === "string") {
+        outputText = item.output.text;
+      } else if (Array.isArray(item.output)) {
+        // Array of content parts [{type:"text",text:"..."}]
+        outputText = item.output.map(p => typeof p === "string" ? p : (p?.text || p?.content || "")).join("");
+      } else if (typeof item.content === "string") {
+        outputText = item.content;
+      } else if (Array.isArray(item.content)) {
+        outputText = item.content.map(p => typeof p === "string" ? p : (p?.text || p?.content || "")).join("");
+      } else if (typeof item.text === "string") {
+        outputText = item.text;
+      } else if (typeof item.result === "string") {
+        outputText = item.result;
+      } else if (item.output != null) {
+        outputText = JSON.stringify(item.output);
+      }
       messages.push({
         role: "tool",
         tool_call_id: item.call_id || "",
