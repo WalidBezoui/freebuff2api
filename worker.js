@@ -2079,10 +2079,9 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
                   await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" } });
                 }
                 const fn = tc.function || {};
-                if (fn.name && !item.name) item.name = fn.name;
+                if (fn.name && !item.name) item.name = mapToolName(fn.name);
                 if (fn.arguments) {
                   item.args += fn.arguments;
-                  await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: fn.arguments });
                 }
               }
             }
@@ -2132,6 +2131,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
               };
               await send({ type: "response.output_item.added", output_index: tcItem.outputIndex, item: { id: tcItem.id, type: "function_call", status: "in_progress", call_id: tcItem.callId, name: tcItem.name, arguments: "" } });
               await send({ type: "response.function_call_arguments.delta", item_id: tcItem.id, output_index: tcItem.outputIndex, delta: tcItem.args });
+              await send({ type: "response.function_call_arguments.done", item_id: tcItem.id, output_index: tcItem.outputIndex, arguments: tcItem.args });
               finalItems.push(tcItem);
             }
             continue;
@@ -2154,6 +2154,16 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
           await send({ type: "response.content_part.done", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part });
           await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "completed", role: "assistant", content: [part] } });
         } else {
+          let cleanArgs = item.args;
+          try {
+            const parsed = JSON.parse(item.args);
+            const sanitized = sanitizeToolPayload(item.name, parsed);
+            item.name = sanitized.fnName;
+            cleanArgs = JSON.stringify(sanitized.args);
+          } catch {}
+          item.args = cleanArgs;
+          await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: cleanArgs });
+          await send({ type: "response.function_call_arguments.done", item_id: item.id, output_index: item.outputIndex, arguments: cleanArgs });
           await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args } });
         }
       }
