@@ -1889,7 +1889,7 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
   return { fnName, args };
 }
 
-function parseXmlToolCallsAndCommentary(rawText) {
+function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
   if (!rawText || typeof rawText !== "string") return { cleanedText: rawText || "", commentary: "", toolCalls: [] };
   
   // Normalize DSML / special unicode tags (e.g. <｜｜DSML｜｜invoke ...>)
@@ -1907,13 +1907,14 @@ function parseXmlToolCallsAndCommentary(rawText) {
     return "";
   });
 
-  const invokeRegex = /<invoke\s+name=["']([^"']+)["']>([\s\S]*?)<\/invoke>/gi;
+  // Support both <invoke name="..."> and <tool_call name="...">
+  const invokeRegex = /<(?:invoke|tool_call)\s+name=["']([^"']+)["']>([\s\S]*?)<\/(?:invoke|tool_call)>/gi;
   let match;
   while ((match = invokeRegex.exec(cleanedText)) !== null) {
     const fnName = match[1].trim();
     const body = match[2];
     let args = {};
-    const paramRegex = /<parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi;
+    const paramRegex = /<parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)(?:<\/parameter>|(?=<parameter|<\/(?:invoke|tool_call)|$))/gi;
     let pMatch;
     let hasParams = false;
     while ((pMatch = paramRegex.exec(body)) !== null) {
@@ -1933,7 +1934,7 @@ function parseXmlToolCallsAndCommentary(rawText) {
       }
     }
     
-    const sanitized = sanitizeToolPayload(fnName, args);
+    const sanitized = sanitizeToolPayload(fnName, args, clientTools);
     toolCalls.push({
       id: "call_" + Math.random().toString(36).slice(2, 10),
       name: sanitized.fnName,
@@ -1943,8 +1944,8 @@ function parseXmlToolCallsAndCommentary(rawText) {
 
   cleanedText = cleanedText
     .replace(/<tool_calls>[\s\S]*?<\/tool_calls>/gi, "")
-    .replace(/<invoke\s+name=["'][^"']+["']>[\s\S]*?<\/invoke>/gi, "")
-    .replace(/<\/?(?:tool_calls|invoke|parameter|textarea)>/gi, "")
+    .replace(/<(?:invoke|tool_call)\s+name=["'][^"']+["']>[\s\S]*?<\/(?:invoke|tool_call)>/gi, "")
+    .replace(/<\/?(?:tool_calls|tool_call|invoke|parameter|textarea)>/gi, "")
     .trim();
 
   return { cleanedText, commentary: commentaryParts.join("\n\n"), toolCalls };
