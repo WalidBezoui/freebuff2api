@@ -1928,6 +1928,19 @@ const SUPPRESSED_TAG_NAMES = new Set([
   "result",
   "function_calls",
   "tool_response",
+  "exec_command",
+  "exec",
+  "bash",
+  "cmd",
+  "command",
+  "read_file",
+  "write_file",
+  "apply_patch",
+  "patch",
+  "read",
+  "shell_command",
+  "run_command",
+  "terminal",
 ]);
 
 class StreamingXmlFilter {
@@ -2125,6 +2138,41 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
       }
     }
     
+    const sanitized = sanitizeToolPayload(fnName, args, clientTools);
+    toolCalls.push({
+      id: "call_" + Math.random().toString(36).slice(2, 10),
+      name: sanitized.fnName,
+      arguments: JSON.stringify(sanitized.args)
+    });
+  }
+
+  // Also support direct tool tags like <exec_command><cmd>...</cmd></exec_command> or <exec><command>...</command></exec>
+  const directToolRegex = /<(exec_command|exec|bash|shell_command|run_command|apply_patch|read_file|write_file)>([\s\S]*?)<\/\1>/gi;
+  let dMatch;
+  while ((dMatch = directToolRegex.exec(cleanedText)) !== null) {
+    const fnName = dMatch[1].trim();
+    const body = dMatch[2];
+    let args = {};
+    const cmdMatch = /<(?:cmd|command)>([\s\S]*?)<\/(?:cmd|command)>/i.exec(body);
+    const patchMatch = /<(?:patch)>([\s\S]*?)<\/(?:patch)>/i.exec(body);
+    const pathMatch = /<(?:path|file|filepath)>([\s\S]*?)<\/(?:path|file|filepath)>/i.exec(body);
+    const contentMatch = /<(?:content)>([\s\S]*?)<\/(?:content)>/i.exec(body);
+
+    if (cmdMatch) args.command = cmdMatch[1].trim();
+    else if (patchMatch) args.patch = patchMatch[1].trim();
+    else if (pathMatch) {
+      args.path = pathMatch[1].trim();
+      if (contentMatch) args.content = contentMatch[1];
+    } else {
+      try {
+        const parsed = JSON.parse(body.trim());
+        if (typeof parsed === "object" && parsed !== null) Object.assign(args, parsed);
+        else args["command"] = body.trim();
+      } catch {
+        if (body.trim()) args["command"] = body.trim();
+      }
+    }
+
     const sanitized = sanitizeToolPayload(fnName, args, clientTools);
     toolCalls.push({
       id: "call_" + Math.random().toString(36).slice(2, 10),
