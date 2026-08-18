@@ -1850,23 +1850,32 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   };
 }
 
-function sanitizeToolPayload(fnName, args) {
-  if (!args || typeof args !== "object") return args;
+function mapToolName(name) {
+  const n = (name || "").toLowerCase().trim();
+  if (n === "exec_command" || n === "bash" || n === "run_command" || n === "shell" || n === "terminal" || n === "cmd") return "exec";
+  if (n === "patch" || n === "edit_file" || n === "write_file") return "apply_patch";
+  if (n === "search" || n === "google_search" || n === "bing_search") return "web_search";
+  return name;
+}
+
+function sanitizeToolPayload(rawFnName, args) {
+  const fnName = mapToolName(rawFnName);
+  if (!args || typeof args !== "object") return { fnName, args };
   const clean = {};
   if (fnName === "exec" || fnName === "shell_command") {
-    clean.cmd = typeof args.cmd === "string" ? args.cmd : typeof args.command === "string" ? args.command : typeof args.input === "string" ? args.input : "";
+    clean.cmd = typeof args.cmd === "string" ? args.cmd : typeof args.command === "string" ? args.command : typeof args.input === "string" ? args.input : typeof args.code === "string" ? args.code : "";
     if (typeof args.workdir === "string" && args.workdir) clean.workdir = args.workdir;
-    return clean;
+    return { fnName: "exec", args: clean };
   }
   if (fnName === "apply_patch") {
     clean.patch = typeof args.patch === "string" ? args.patch : typeof args.input === "string" ? args.input : "";
-    return clean;
+    return { fnName: "apply_patch", args: clean };
   }
   if (fnName === "web_search" || fnName === "fetch_web_search") {
     clean.query = typeof args.query === "string" ? args.query : typeof args.input === "string" ? args.input : "";
-    return clean;
+    return { fnName: "web_search", args: clean };
   }
-  return args;
+  return { fnName, args };
 }
 
 function parseXmlToolCallsAndCommentary(rawText) {
@@ -1913,11 +1922,11 @@ function parseXmlToolCallsAndCommentary(rawText) {
       }
     }
     
-    args = sanitizeToolPayload(fnName, args);
+    const sanitized = sanitizeToolPayload(fnName, args);
     toolCalls.push({
       id: "call_" + Math.random().toString(36).slice(2, 10),
-      name: fnName,
-      arguments: JSON.stringify(args)
+      name: sanitized.fnName,
+      arguments: JSON.stringify(sanitized.args)
     });
   }
 
@@ -2028,7 +2037,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       id: "fc_" + Math.random().toString(36).slice(2, 10),
       outputIndex: nextOutputIndex++,
       callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
-      name: fn.name || "",
+      name: mapToolName(fn.name || ""),
       args: "",
     };
     items.push(item);
