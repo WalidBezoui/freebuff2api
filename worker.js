@@ -2011,10 +2011,13 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
     : "";
 
   if (fnName === "exec") {
-    if (/^\s*(await\s+tools\.|tools\.|const\s+|let\s+|\/\/\s*@exec)/.test(cmdVal)) {
+    if (/^\s*(text\(|await\s+tools\.|tools\.|const\s+|let\s+|\/\/\s*@exec)/.test(cmdVal)) {
+      if (/^\s*(await\s+tools\.)/.test(cmdVal)) {
+        return { fnName: "exec", args: `text(${cmdVal});` };
+      }
       return { fnName: "exec", args: cmdVal };
     }
-    return { fnName: "exec", args: `await tools.shell_command({ command: ${JSON.stringify(cmdVal)} });` };
+    return { fnName: "exec", args: `text(await tools.shell_command({ command: ${JSON.stringify(cmdVal)} }));` };
   }
 
   if (!args || typeof args !== "object") return { fnName, args };
