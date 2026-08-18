@@ -1348,13 +1348,25 @@ function responsesInputToMessages(input, instructions) {
     if (item.type === "reasoning" || item.type === "item_reference") continue;
     const role = item.role || "user";
     const content = item.content;
-    if (typeof content === "string") { messages.push({ role, content }); continue; }
+    if (typeof content === "string") {
+      const clean = getVisibleCleanText(content);
+      messages.push({ role, content: clean !== "" ? clean : content });
+      continue;
+    }
     if (Array.isArray(content)) {
       const parts = [];
       for (const c of content) {
         if (!c || typeof c !== "object") continue;
-        if (c.type === "input_text" || c.type === "output_text") { parts.push({ type: "text", text: c.text ?? "" }); continue; }
-        if (c.type === "text" && typeof c.text === "string") { parts.push(c); continue; }
+        if (c.type === "input_text" || c.type === "output_text") {
+          const clean = getVisibleCleanText(c.text ?? "");
+          parts.push({ type: "text", text: clean !== "" ? clean : (c.text ?? "") });
+          continue;
+        }
+        if (c.type === "text" && typeof c.text === "string") {
+          const clean = getVisibleCleanText(c.text);
+          parts.push({ type: "text", text: clean !== "" ? clean : c.text });
+          continue;
+        }
       }
       messages.push({ role, content: parts.length ? parts : "" });
       continue;
@@ -1889,6 +1901,20 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
   return { fnName, args };
 }
 
+function getVisibleCleanText(rawText) {
+  if (!rawText || typeof rawText !== "string") return "";
+  let text = rawText.replace(/<\/?(?:[^\w\s<>]*DSML[^\w\s<>]*)?([a-zA-Z_]+)/gi, (m, tag) => {
+    return m.startsWith("</") ? `</${tag}` : `<${tag}`;
+  });
+  text = text.replace(/<textarea\s+placeholder=["']commentary["'][^>]*>[\s\S]*?(?:<\/textarea>|$)/gi, "");
+  text = text.replace(/<(?:commentary|thought|thinking)[^>]*>[\s\S]*?(?:<\/(?:commentary|thought|thinking)>|$)/gi, "");
+  text = text.replace(/<tool_calls[^>]*>[\s\S]*?(?:<\/tool_calls>|$)/gi, "");
+  text = text.replace(/<(?:invoke|tool_call)[^>]*>[\s\S]*?(?:<\/(?:invoke|tool_call)>|$)/gi, "");
+  text = text.replace(/<parameter[^>]*>[\s\S]*?(?:<\/parameter>|$)/gi, "");
+  text = text.replace(/<[^\s>]*$/gi, "");
+  return text;
+}
+
 function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
   if (!rawText || typeof rawText !== "string") return { cleanedText: rawText || "", commentary: "", toolCalls: [] };
   
@@ -2024,35 +2050,20 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
   let buf = "", model = "", usage = null;
   const send = (obj) => writer.write(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
 
-  // 按上游出现顺序记录输出项：message（文本）或 function_call（工具调用）
-  const items = [];
-  let nextOutputIndex = 0;
   let contentItem = null;
-  const toolItems = new Map(); // 上游 tool_calls index → 输出项
+  let rawTextAccumulator = "";
+  let alreadyEmittedCleanLength = 0;
+  const nativeToolItems = new Map(); // 上游原生 tool_calls index → {id, callId, name, args}
 
   const startContent = () => {
     const item = {
       kind: "message",
       id: "msg_" + Math.random().toString(36).slice(2, 10),
-      outputIndex: nextOutputIndex++,
+      outputIndex: 0,
       text: "",
       contentIndex: 0,
       started: false,
     };
-    items.push(item);
-    return item;
-  };
-  const startTool = (tc) => {
-    const fn = tc.function || {};
-    const item = {
-      kind: "function_call",
-      id: "fc_" + Math.random().toString(36).slice(2, 10),
-      outputIndex: nextOutputIndex++,
-      callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
-      name: fn.name || "",
-      args: "",
-    };
-    items.push(item);
     return item;
   };
 
@@ -2076,10 +2087,10 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
             const choice = obj?.choices?.[0];
             if (!choice) continue;
             const delta = choice.delta || {};
-                if (obj.model) model = obj.model;
-                if (obj.usage) usage = obj.usage;
+            if (obj.model) model = obj.model;
+            if (obj.usage) usage = obj.usage;
 
-            // 工具调用增量（chat 格式 delta.tool_calls[]）
+            // 原生工具调用增量（chat 格式 delta.tool_calls[]）
             if (Array.isArray(delta.tool_calls)) {
               for (const tc of delta.tool_calls) {
                 if (!tc || typeof tc !== "object") continue;
