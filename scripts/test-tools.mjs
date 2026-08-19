@@ -248,6 +248,131 @@ async function responsesStreamTest(chunks, tools = execTools, input = [{ role: "
   check("T8 upstream got tool result", upStr.includes("42 files") && upStr.includes("exec"), upStr.slice(0, 300));
 }
 
+// ---------- T9: non-stream responses, native + XML dup -> sanitize + dedup ----------
+{
+  const dsml = `<${P}invoke name="exec_command"><${P}parameter name="cmd">dir /b</${P}parameter></${P}invoke>`;
+  currentStream = [
+    chunk({ role: "assistant", content: "Running.\n" + dsml }),
+    chunk({ tool_calls: [{ index: 0, id: "call_abc", type: "function", function: { name: "exec_command", arguments: "" } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ command: "dir /b" }) } }] }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "list files" }], tools: execTools, stream: false }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const json = await res.json();
+  const toolOutputs = (json?.output || []).filter((o) => o.type === "custom_tool_call" || o.type === "function_call");
+  check("T9 non-stream dedup: exactly one tool call", toolOutputs.length === 1, JSON.stringify(toolOutputs));
+  check("T9 non-stream sanitized input", toolOutputs[0]?.input === textOf("dir /b"), JSON.stringify(toolOutputs[0]));
+  check("T9 non-stream no XML leak", !JSON.stringify(json).includes("<"), "");
+}
+
+// ---------- T10: parallel native tool calls (two indexes) ----------
+{
+  currentStream = [
+    chunk({ tool_calls: [
+      { index: 0, id: "call_a", type: "function", function: { name: "exec_command", arguments: JSON.stringify({ command: "dir /b" }) } },
+      { index: 1, id: "call_b", type: "function", function: { name: "exec_command", arguments: JSON.stringify({ command: "dir /a" }) } },
+    ] }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "list" }], tools: execTools, stream: true }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const completed = events.find((e) => e.type === "response.completed");
+  const tools = (completed?.response?.output || []).filter((o) => o.type === "custom_tool_call");
+  check("T10 two parallel calls", tools.length === 2, JSON.stringify(tools.map((t) => t.input)));
+  check("T10 both sanitized", tools.every((t) => t.input === textOf(t.input.includes("dir /b") ? "dir /b" : "dir /a")), JSON.stringify(tools));
+}
+
+// ---------- T11: apply_patch + web_search XML mapping ----------
+{
+  const patch = "--- a.txt\n+++ b.txt\n@@ -1 +1 @@\n-old\n+new\n";
+  const dsml = `<${P}invoke name="apply_patch"><${P}parameter name="patch">${patch}</${P}parameter></${P}invoke><${P}invoke name="web_search"><${P}parameter name="query">nodejs 22</${P}parameter></${P}invoke>`;
+  const clientTools = [
+    { type: "function", function: { name: "apply_patch", description: "Apply a patch", parameters: { type: "object", properties: { patch: { type: "string" } } } } },
+    { type: "function", function: { name: "web_search", description: "Search the web", parameters: { type: "object", properties: { query: { type: "string" } } } } },
+  ];
+  currentStream = [chunk({ role: "assistant", content: "Let me patch.\n" + dsml }), { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "patch and search" }], tools: clientTools, stream: true }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const completed = events.find((e) => e.type === "response.completed");
+  const out = completed?.response?.output || [];
+  const patchCall = out.find((o) => o.type === "function_call" && o.name === "apply_patch");
+  const searchCall = out.find((o) => o.type === "function_call" && o.name === "web_search");
+  check("T11 apply_patch mapped", !!patchCall && patchCall.arguments.includes("--- a.txt"), JSON.stringify(patchCall));
+  check("T11 web_search mapped", !!searchCall && searchCall.arguments.includes("nodejs 22"), JSON.stringify(searchCall));
+  check("T11 no XML leak", !JSON.stringify(events).includes("<"), "");
+}
+
+// ---------- T12: byte-chunked DSML (streaming boundary robustness) ----------
+{
+  const dsml = `<${P}tool_calls><${P}invoke name="exec_command"><${P}parameter name="cmd">npm test</${P}parameter></${P}invoke></${P}tool_calls>`;
+  const full = "data: " + JSON.stringify(chunk({ role: "assistant", content: "hi\n" + dsml })) + "\n\n" +
+    "data: " + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }) + "\n\n";
+  const enc = new TextEncoder();
+  const bytes = enc.encode(full);
+  currentStream = [];
+  globalThis.__mockRawStream = new ReadableStream({
+    start(controller) {
+      for (let i = 0; i < bytes.length; i += 3) controller.enqueue(bytes.subarray(i, i + 3));
+      controller.close();
+    },
+  });
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes("/api/v1/freebuff/session")) return new Response(sessionBody, { status: 200, headers: { "Content-Type": "application/json" } });
+    if (u.includes("/api/v1/agent-runs") || u.includes("/steps")) return new Response("{}", { status: 200 });
+    if (u.includes("/api/v1/chat/completions")) return new Response(globalThis.__mockRawStream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    throw new Error("mock2: unexpected URL " + u);
+  };
+  try {
+    const req = new Request("https://localhost/v1/responses", {
+      method: "POST", headers: AUTH,
+      body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "run tests" }], tools: execTools, stream: true }),
+    });
+    const res = await worker.fetch(req, ENV);
+    const events = await readSSE(res);
+    const completed = events.find((e) => e.type === "response.completed");
+    const out = completed?.response?.output || [];
+    const call = out.find((o) => o.type === "custom_tool_call");
+    check("T12 byte-chunked DSML parsed", call?.input === textOf("npm test"), JSON.stringify(call));
+    check("T12 no XML leak", !JSON.stringify(events).includes("<"), "");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+}
+
+// ---------- T13: upstream never sends finish_reason ----------
+{
+  currentStream = [
+    { id: "cmpl-9", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { role: "assistant", content: "plain text answer" }, finish_reason: null }] },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "hi" }], stream: true }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const completed = events.find((e) => e.type === "response.completed");
+  const text = (completed?.response?.output || []).map((o) => o.content?.[0]?.text || "").join("");
+  check("T13 completed despite no finish_reason", completed?.response?.status === "completed" && text.includes("plain text"), text.slice(0, 100));
+}
+
 const failed = results.filter((r) => !r.ok);
 console.log("\n=== " + (results.length - failed.length) + "/" + results.length + " passed ===");
 process.exit(failed.length ? 1 : 0);
