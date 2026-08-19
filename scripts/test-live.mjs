@@ -95,7 +95,7 @@ async function readSSE(res) {
     if (calls.length) {
       for (const c of calls) {
         check("L3 tool call has exec name", c.name === "exec", c.name);
-        check("L3 tool input is JS with text(await tools...)", /^text\(await tools\.shell_command\(\{ command: "echo hello-from-codebuff" \}\)\);$/.test(c.input), c.input);
+        check("L3 tool input is JS with text(await tools...)", /^text\(await tools\.exec_command\(\{ cmd: "echo hello-from-codebuff" \}\)\);$/.test(c.input), c.input);
         toolCalls.push(c);
         input.push({ type: "custom_tool_call", call_id: c.call_id, name: c.name, input: c.input });
         input.push({ type: "custom_tool_call_output", call_id: c.call_id, output: "hello-from-codebuff" });
@@ -122,7 +122,7 @@ async function readSSE(res) {
   const calls = msg?.tool_calls || [];
   check("L4 chat non-stream 200", res.status === 200, res.status + " " + body);
   check("L4 tool_calls present", Array.isArray(calls) && calls.length > 0, JSON.stringify(msg).slice(0, 300));
-  check("L4 tool name exec + wrapped args", calls[0]?.function?.name === "exec" && /text\(await tools\.shell_command/.test(calls[0]?.function?.arguments || ""), JSON.stringify(calls[0]));
+  check("L4 tool name exec + wrapped args", calls[0]?.function?.name === "exec" && /text\(await tools\.exec_command/.test(calls[0]?.function?.arguments || ""), JSON.stringify(calls[0]));
   check("L4 content no XML leak", !JSON.stringify(msg?.content || "").includes("<"), msg?.content);
 }
 
@@ -164,7 +164,7 @@ async function readSSE(res) {
   const tcEvent = events.find((e) => e.choices?.[0]?.delta?.tool_calls);
   check("L6 chat stream 200", res.status === 200, "status=" + res.status);
   check("L6 tool_calls emitted", !!tcEvent, "");
-  check("L6 tool_calls sanitized", /text\(await tools\.shell_command/.test(JSON.stringify(tcEvent?.choices?.[0]?.delta?.tool_calls)), JSON.stringify(tcEvent?.choices?.[0]?.delta?.tool_calls).slice(0, 300));
+  check("L6 tool_calls sanitized", /text\(await tools\.exec_command/.test(JSON.stringify(tcEvent?.choices?.[0]?.delta?.tool_calls)), JSON.stringify(tcEvent?.choices?.[0]?.delta?.tool_calls).slice(0, 300));
   check("L6 finish_reason tool_calls", events.some((e) => e.choices?.[0]?.finish_reason === "tool_calls"));
   check("L6 no XML leak", !all.includes("DSML") && !all.includes("antml") && !all.includes("<"), "");
 }
@@ -224,7 +224,7 @@ async function readSSE(res) {
       if (calls.length) {
         sawCall = true;
         for (const c of calls) {
-          if (!/^text\(await tools\.shell_command\(\{ command: "echo nonstream-ok" \}\)\);$/.test(c.input || "")) sawCallSanitized = false;
+          if (!/^text\(await tools\.exec_command\(\{ cmd: "echo nonstream-ok" \}\)\);$/.test(c.input || "")) sawCallSanitized = false;
           input.push({ type: "custom_tool_call", call_id: c.call_id, name: c.name, input: c.input });
           input.push({ type: "custom_tool_call_output", call_id: c.call_id, output: "nonstream-ok" });
         }
