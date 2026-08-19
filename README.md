@@ -141,10 +141,9 @@ python3 extract_freebuff.py chat "你好"      # 发一条消息测试模型 API
 # 1. 准备目录，复制以下文件：worker.js server.js package.json Dockerfile docker-compose.yml
 mkdir freebuff2api && cd freebuff2api
 
-# 2. 配置 .env（API key + 可选 RELAY_KEY）
+# 2. 配置 .env（API key）
 cat > .env <<'EOF'
 FREEBUFF_API_KEY=your-api-key
-RELAY_KEY=
 EOF
 
 # 3. 账号凭据：credentials/ 下每个账号一个 json（server.js 读取 authToken 字段）
@@ -163,12 +162,27 @@ docker compose up -d --build
 | 变量 | 说明 |
 |---|---|
 | `PORT` / `HOST` | 监听端口/地址，默认 `8787` / `0.0.0.0` |
-| `FREEBUFF_API_KEY` | 本 API 访问 key（缺省 `freebuff-default-key`） |
+| `FREEBUFF_API_KEY` | 本 API 访问 key。**必填**：未配置时所有请求返回 401（不设默认密钥后门）；本地开发默认 `freebuff-default-key` |
 | `FREEBUFF_DEBUG` | `true` 开启请求级调试日志 |
-| `CODEBUFF_API` | 上游地址，默认空=直连 `https://www.codebuff.com`；走自建中继时设为中继域名 |
-| `RELAY_KEY` | 中继密钥（`CODEBUFF_API` 指向带鉴权的中继时必填） |
 
 > ⚠️ 容器内 `credentials/` 以只读方式挂载；`server.js` 启动时读取并组装 `FREEBUFF_TOKEN`（多账号逗号分隔）。
+
+### ▲ Vercel 部署（本仓库当前线上部署方式）
+
+```bash
+npx vercel --prod
+```
+
+1. 项目设置 → **环境变量** 添加（生产环境）：
+
+   | 名称 | 值 |
+   |---|---|
+   | `FREEBUFF_TOKEN` | freebuff token（多账号逗号/换行分隔） |
+   | `FREEBUFF_API_KEY` | 访问 key（**必填**，未设置时所有请求 401） |
+
+2. `vercel.json` 已配置 `maxDuration: 300`（长流/长推理不被 Hobby 60s 截断；Pro 上限 300s）。
+3. 部署验证：`curl https://<你的项目>.vercel.app/healthz` 应返回 `version`；`/v1/models` 需带 `Authorization: Bearer <FREEBUFF_API_KEY>`。
+4. 每次改代码后记得把 `worker.js` 顶部 `VERSION` 升一档，便于确认线上已更新。
 
 ### Cloudflare Worker 部署（❌ 不推荐）
 
@@ -188,7 +202,7 @@ worker 是**单文件**（`worker.js`），如仍需在 CF 部署：
    | 类型 | 名称 | 值 |
    |---|---|---|
    | 机密 | `FREEBUFF_TOKEN` | 你的 freebuff token（多账号用英文逗号分隔） |
-   | 机密 | `FREEBUFF_API_KEY` | 自定义访问 key（可选，不设则用 `freebuff-default-key`） |
+   | 机密 | `FREEBUFF_API_KEY` | 自定义访问 key（**必填**：不设则所有请求 401） |
 
 5. 部署完成后访问验证：
 

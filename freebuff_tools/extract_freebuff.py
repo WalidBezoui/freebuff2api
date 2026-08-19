@@ -36,6 +36,10 @@ import json
 import os
 import secrets
 import sys
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
 import time
 import urllib.parse
 import urllib.request
@@ -266,9 +270,15 @@ def cmd_login(args):
             sys.exit(1)
         print("📨 授权链接已推送到 Telegram（URL 不打印到日志）。")
     else:
-        # 非 TG（本地手动跑）才打印 URL
+        # 非 TG（本地手动跑）才打印 URL 并自动在默认浏览器中打开
+        import webbrowser
+        try:
+            webbrowser.open(login_url)
+            print("🌐 已自动在默认浏览器中打开登录页面...")
+        except Exception:
+            pass
         print("=" * 60)
-        print("1️⃣  在浏览器打开下面这个链接：")
+        print("1️⃣  如果浏览器没有自动弹出，请在浏览器打开下面这个链接：")
         print(f"    {login_url}")
         print("2️⃣  用 Google 账号登录并授权")
         print(f"3️⃣  脚本自动轮询等待，最多 {poll_timeout} 秒")
