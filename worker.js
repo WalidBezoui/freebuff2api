@@ -1380,7 +1380,6 @@ function responsesToChatParams(params, mc) {
   }
   // 记录客户端原始工具集，供下游 sanitizeToolPayload 决定回传 function_call 还是 custom_tool_call。
   // _clientTools 不是 UPSTREAM_KEYS，buildUpstreamPayload 不会把它转发给上游。
-  chat._clientTools = Array.isArray(params.tools) ? params.tools : [];
   chat.model = mc.id;
   chat.messages = responsesInputToMessages(params.input, params.instructions);
   return chat;
@@ -1417,23 +1416,11 @@ function responsesInputToMessages(input, instructions) {
       continue;
     }
 
-    // Codex v0.147 custom_tool_call = exec tool (assistant side)
+    // Codex custom_tool_call = exec tool (assistant side)
     if (item.type === "custom_tool_call") {
       const callId = item.call_id || item.id || ("call_" + Math.random().toString(36).slice(2, 10));
-      // Extract command string if JS wrapper is present, ensuring valid JSON arguments with cmd field for upstream LLM
-      let cmdString = "";
-      if (typeof item.input === "string") {
-        const m = /command\s*:\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/.exec(item.input);
-        if (m) {
-          try {
-            cmdString = JSON.parse(`"${m[2]}"`);
-          } catch {
-            cmdString = m[2];
-          }
-        } else {
-          cmdString = item.input;
-        }
-      }
+      // 兼容新旧 exec 写法（v0.148: tools.exec_command({cmd}) / v0.147: tools.shell_command({command})）
+      let cmdString = extractExecCommandText(typeof item.input === "string" ? item.input : "");
       const argsPayload = JSON.stringify({ cmd: cmdString, command: cmdString });
       const tc = {
         id: callId,
@@ -2230,6 +2217,49 @@ function stripResidualXml(value) {
     .trim();
 }
 
+// 从客户端 exec 工具声明推导命令执行器 JS API。
+// Codex v0.148 移除了 tools.shell_command，规范改为 tools.exec_command({ cmd })；
+// v0.147 的 exec 描述同时写了 exec_command 与 shell_command，exec_command 是两者共享契约 → 优先使用。
+// 只有客户端描述里明确只出现 shell_command 时才回退 shell_command({ command })。
+function execApiFromClient(clientTools) {
+  const tools = Array.isArray(clientTools) ? clientTools : [];
+  const exec = tools.find((t) => {
+    const n = (t?.name || t?.function?.name || "").toLowerCase();
+    return n === "exec" || n === "exec_command" || n === "shell_command" || t?.type === "custom" || t?.type === "local_shell";
+  });
+  const desc = exec && typeof exec.description === "string" ? exec.description : "";
+  const hasExecCmd = /tools\.exec_command\(/.test(desc) || /exec_command\(args:\s*\{[\s\S]*?\bcmd\s*:\s*string/.test(desc);
+  const hasShellCmd = /tools\.shell_command\(/.test(desc) || /shell_command\(args:\s*\{[\s\S]*?\bcommand\s*:\s*string/.test(desc);
+  if (hasExecCmd && !hasShellCmd) return { fn: "exec_command", key: "cmd" };
+  if (hasShellCmd && !hasExecCmd) return { fn: "shell_command", key: "command" };
+  return { fn: "exec_command", key: "cmd" };
+}
+
+// 从 Codex custom_tool_call 的 JS input 中稳健提取要执行的命令字符串。
+// 兼容新旧两种 exec 写法（exec_command({cmd}) / shell_command({command})）及裸 JSON。
+function extractExecCommandText(input) {
+  if (typeof input !== "string" || input.length === 0) return "";
+  for (const re of [
+    /cmd\s*:\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/,
+    /command\s*:\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/,
+  ]) {
+    const m = re.exec(input);
+    if (m) {
+      try {
+        return JSON.parse(`"${m[2]}"`);
+      } catch {
+        return m[2];
+      }
+    }
+  }
+  try {
+    const o = JSON.parse(input);
+    if (typeof o.cmd === "string") return o.cmd;
+    if (typeof o.command === "string") return o.command;
+  } catch {}
+  return input.trim();
+}
+
 function sanitizeToolPayload(rawFnName, args, clientTools = []) {
   let hasExecCommand = false;
   let hasExec = false;
@@ -2280,10 +2310,12 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
     }
     // 空命令兜底：绝不把 command:"" 交出去执行（Codex 会报错），
     // 用无害的 echo 产生空 stdout + exit 0。
+    const execApi = execApiFromClient(clientTools);
+    const wrapExec = (cmd) => `text(await tools.${execApi.fn}({ ${execApi.key}: ${JSON.stringify(cmd)} }));`;
     if (!cmdVal || cmdVal.length === 0) {
-      return { fnName: "exec", args: `text(await tools.shell_command({ command: "echo ''" }));` };
+      return { fnName: "exec", args: wrapExec("echo ''") };
     }
-    return { fnName: "exec", args: `text(await tools.shell_command({ command: ${JSON.stringify(cmdVal)} }));` };
+    return { fnName: "exec", args: wrapExec(cmdVal) };
   }
 
   if (!args || typeof args !== "object") return { fnName, args: cmdVal };

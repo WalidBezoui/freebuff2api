@@ -112,7 +112,7 @@ const loadCapture = (name) => {
 
 const turn1 = loadCapture("002");
 const turn2 = loadCapture("003");
-const textOf = (cmd) => `text(await tools.shell_command({ command: ${JSON.stringify(cmd)} }));`;
+const textOf = (cmd) => `text(await tools.exec_command({ cmd: ${JSON.stringify(cmd)} }));`;
 
 async function replay(body, streamChunks) {
   currentStream = streamChunks;
@@ -160,7 +160,8 @@ const r1 = await replay(turn1.body, nativeExecStream("echo captured-roundtrip"))
   check("R2 exactly one custom_tool_call added", tools.length === 1, JSON.stringify(tools.map((t) => t.item.name)));
   check("R2 added name is exec", tools[0]?.item.name === "exec", tools[0]?.item.name);
   const done = r1.events.filter((e) => e.type === "response.custom_tool_call_input.done");
-  check("R2 input matches real capture (shell_command wrapper)", done[0]?.input === textOf("echo captured-roundtrip"), done[0]?.input);
+  // v0.148 移除 tools.shell_command，改用 tools.exec_command({ cmd })，见 execApiFromClient。
+  check("R2 input uses exec_command({cmd}) (v0.148 API)", done[0]?.input === textOf("echo captured-roundtrip"), done[0]?.input);
   const completed = r1.events.find((e) => e.type === "response.completed");
   const outTool = completed?.response?.output?.find((o) => o.type === "custom_tool_call");
   check("R2 completed output sanitized", outTool?.input === textOf("echo captured-roundtrip"), JSON.stringify(outTool));
@@ -200,6 +201,87 @@ const r3 = await replay(turn2.body, [
   const completed = r3.events.find((e) => e.type === "response.completed");
   const outMsg = completed?.response?.output?.find((o) => o.type === "message");
   check("R4 completed output has message", outMsg?.content?.[0]?.type === "output_text", JSON.stringify(outMsg));
+}
+
+// ---------- R5: exec API derived from a v0.148-style exec description (exec_command only) ----------
+{
+  const body = {
+    model: MODEL, stream: true,
+    input: [
+      {
+        type: "additional_tools", role: "developer",
+        tools: [{
+          type: "namespace", name: "functions", tools: [
+            { type: "custom", name: "exec", description: "All nested tools are available on the global `tools` object, for example `await tools.exec_command(...)`.\n\nexec tool declaration:\n```ts\ndeclare const tools: { exec_command(args: { cmd: string; }): Promise<{ output: string }>; };\n```" },
+          ],
+        }],
+      },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "list files" }] },
+    ],
+  };
+  const { events } = await replay(body, nativeExecStream("dir /b"));
+  const done = events.filter((e) => e.type === "response.custom_tool_call_input.done");
+  check("R5 v0.148 desc -> exec_command({cmd}) wrapper", done[0]?.input === `text(await tools.exec_command({ cmd: "dir /b" }));`, done[0]?.input);
+}
+
+// ---------- R6: exec API derived from a shell_command-only description (legacy v0.147-style) ----------
+{
+  const body = {
+    model: MODEL, stream: true,
+    input: [
+      {
+        type: "additional_tools", role: "developer",
+        tools: [{
+          type: "namespace", name: "functions", tools: [
+            { type: "custom", name: "exec", description: "All nested tools are available on the global `tools` object.\n\n### shell_command\nRuns a Powershell command.\n\ndeclare const tools: { shell_command(args: { command: string; }): Promise<string>; };" },
+          ],
+        }],
+      },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "run tests" }] },
+    ],
+  };
+  const { events } = await replay(body, nativeExecStream("npm test"));
+  const done = events.filter((e) => e.type === "response.custom_tool_call_input.done");
+  check("R6 shell_command-only desc -> shell_command({command}) wrapper", done[0]?.input === `text(await tools.shell_command({ command: "npm test" }));`, done[0]?.input);
+}
+
+// ---------- R7: parser handles v0.148 custom_tool_call input (exec_command({cmd})) ----------
+{
+  const body = {
+    model: MODEL, stream: true,
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "re-run" }] },
+      { type: "custom_tool_call", call_id: "call_v148_1", name: "exec", input: 'const res = await tools.exec_command({ cmd: "echo v148-capture" });\ntext(JSON.stringify(res));' },
+      { type: "custom_tool_call_output", call_id: "call_v148_1", output: [{ type: "input_text", text: '{"exit_code":0,"output":"v148-capture\\r\\n"}' }] },
+    ],
+  };
+  const { upstream } = await replay(body, nativeExecStream("echo v148-capture"));
+  const msgs = upstream?.messages || [];
+  const prev = msgs[msgs.length - 2];
+  const fn = prev?.tool_calls?.[0]?.function;
+  let args = {};
+  try { args = JSON.parse(fn?.arguments || "{}"); } catch {}
+  check("R7 v0.148 input cmd extracted", args.cmd === "echo v148-capture", JSON.stringify(args));
+  check("R7 v0.148 tool result kept", String(msgs[msgs.length - 1]?.content).includes("v148-capture"), String(msgs[msgs.length - 1]?.content).slice(0, 80));
+}
+
+// ---------- R8: parser still handles legacy shell_command({command}) input ----------
+{
+  const body = {
+    model: MODEL, stream: true,
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "run tests" }] },
+      { type: "custom_tool_call", call_id: "call_v147_1", name: "exec", input: `text(await tools.shell_command({ command: "npm test" }));` },
+      { type: "custom_tool_call_output", call_id: "call_v147_1", output: [{ type: "input_text", text: "ok" }] },
+    ],
+  };
+  const { upstream } = await replay(body, nativeExecStream("npm test"));
+  const msgs = upstream?.messages || [];
+  const prev = msgs[msgs.length - 2];
+  const fn = prev?.tool_calls?.[0]?.function;
+  let args = {};
+  try { args = JSON.parse(fn?.arguments || "{}"); } catch {}
+  check("R8 legacy input cmd extracted", args.cmd === "npm test", JSON.stringify(args));
 }
 
 const passed = results.filter((r) => r.ok).length;

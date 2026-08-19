@@ -95,7 +95,7 @@ function nativeExecStream(command) {
 }
 
 const execTools = [{ type: "custom", name: "exec", description: "Run shell commands", input_schema: { type: "object", properties: { command: { type: "string" } } } }];
-const textOf = (cmd) => `text(await tools.shell_command({ command: ${JSON.stringify(cmd)} }));`;
+const textOf = (cmd) => `text(await tools.exec_command({ cmd: ${JSON.stringify(cmd)} }));`;
 
 async function responsesStreamTest(chunks, tools = execTools, input = [{ role: "user", content: "list files" }]) {
   currentStream = chunks;
@@ -158,7 +158,7 @@ async function responsesStreamTest(chunks, tools = execTools, input = [{ role: "
     { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
   ]);
   const done = events.filter((e) => e.type === "response.custom_tool_call_input.done");
-  check("T4 empty command falls back to echo", done[0]?.input === `text(await tools.shell_command({ command: "echo ''" }));`, done[0]?.input);
+  check("T4 empty command falls back to echo", done[0]?.input === `text(await tools.exec_command({ cmd: "echo ''" }));`, done[0]?.input);
 }
 
 // ---------- T5: non-stream chat keeps tool_calls + no DSML ----------
