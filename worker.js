@@ -1676,7 +1676,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
 
       if (isStream) {
         const { readable, writable } = new TransformStream();
-        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, null, chatParams?._clientTools || []);
+        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, null, chatParams?._clientTools || [], isDsmlPassthrough(chatParams));
         else {
           const sanitize = chatShouldSanitize(chatParams);
           pipeUpstreamToClient(resp.body, writable, null, { sanitize, clientTools: chatParams?._clientTools || chatParams?.tools || [] });
@@ -1684,7 +1684,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
 
-      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc, chatParams?._clientTools || []), 200);
+      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc, chatParams?._clientTools || [], isDsmlPassthrough(chatParams)), 200);
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
       // 非流式 chat 同样过滤 DSML/XML：清理 content，并统一净化/合并原生+XML 工具调用
@@ -1941,7 +1941,7 @@ function unwrapData(obj) {
 // DSML 客户端（DeepSeek 原生）依赖 content 里的 XML 标签，绝不拦截。
 function chatShouldSanitize(chatParams) {
   if (!chatParams || typeof chatParams !== "object") return true;
-  if (chatParams.metadata && (chatParams.metadata.freebuff_dsml === true || chatParams.metadata.freebuff_dsml === "true")) return false;
+  if (isDsmlPassthrough(chatParams)) return false;
   const tools = Array.isArray(chatParams.tools) ? chatParams.tools : [];
   if (tools.length === 0) return true; // 无工具 → 只做文本过滤，DSML 客户端无工具时也不依赖标签
   const execLike = new Set(["exec_command", "exec", "shell_command", "bash", "run_command", "cmd", "terminal", "shell"]);
@@ -1950,6 +1950,12 @@ function chatShouldSanitize(chatParams) {
     const n = (t.function?.name || t.name || "").toLowerCase();
     return execLike.has(n);
   });
+}
+
+// DSML 客户端显式选择原样透传（metadata.freebuff_dsml=true）：不过滤 XML、不合成原生工具调用
+function isDsmlPassthrough(chatParams) {
+  return Boolean(chatParams?.metadata &&
+    (chatParams.metadata.freebuff_dsml === true || chatParams.metadata.freebuff_dsml === "true"));
 }
 
 // 流式：把上游 SSE 剥 {data:...} 包装后透传。
@@ -2598,7 +2604,7 @@ function chatUsageToResponsesUsage(usage) {
 }
 
 // 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
-async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete, clientTools = []) {
+async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete, clientTools = [], dsmlPassthrough = false) {
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
   const decoder = new TextDecoder();
@@ -2611,7 +2617,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
 
   let contentItem = null;
   let rawTextAccumulator = "";
-  const xmlFilter = new StreamingXmlFilter();
+  const xmlFilter = dsmlPassthrough ? null : new StreamingXmlFilter();
   const nativeToolItems = new Map(); // 上游原生 tool_calls index → {id, callId, name, args, outputIndex, started}
 
   (async () => {
@@ -2638,7 +2644,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
             if (obj.usage) usage = obj.usage;
 
             // 原生工具调用增量（chat 格式 delta.tool_calls[]）：实时上屏 output_item.added
-            if (Array.isArray(delta.tool_calls)) {
+            if (Array.isArray(delta.tool_calls) && !dsmlPassthrough) {
               for (const tc of delta.tool_calls) {
                 if (!tc || typeof tc !== "object") continue;
                 const ti = tc.index ?? 0;
@@ -2672,7 +2678,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
             // 文本增量：实时过滤 DSML / commentary / tool_calls / attempt_completion 标签，绝不把 XML 泄露给客户端
             if (delta.content) {
               rawTextAccumulator += delta.content;
-              const newDelta = xmlFilter.feed(delta.content);
+              const newDelta = dsmlPassthrough ? delta.content : xmlFilter.feed(delta.content);
               if (newDelta.length > 0) {
                 if (!contentItem) {
                   contentItem = {
@@ -2697,19 +2703,19 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         }
       }
 
-      const flushed = xmlFilter.flush();
+      const flushed = xmlFilter ? xmlFilter.flush() : "";
       if (flushed && contentItem) {
         contentItem.text += flushed;
         await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: 0, delta: flushed });
       }
 
-      // 收尾：统一解析 XML tool calls 和 commentary
+      // 收尾：统一解析 XML tool calls 和 commentary（DSML 透传时跳过，标签原样保留在文本里）
       const finalItems = [];
-      const parsed = parseXmlToolCallsAndCommentary(rawTextAccumulator, clientTools);
+      const parsed = dsmlPassthrough ? { cleanedText: rawTextAccumulator, toolCalls: [], commentary: "" } : parseXmlToolCallsAndCommentary(rawTextAccumulator, clientTools);
       const cleanMessageText = parsed.cleanedText || "";
 
       // 仅当确实有干净文本（或者既无工具也无文本时）才添加 message item
-      const hasToolCalls = parsed.toolCalls.length > 0 || nativeToolItems.size > 0;
+      const hasToolCalls = !dsmlPassthrough && (parsed.toolCalls.length > 0 || nativeToolItems.size > 0);
       if (contentItem) {
         // If XML filtering emptied the streamed text, fall back to raw text then to a space
         // (Codex rejects responses where output_text is completely empty)
@@ -2863,7 +2869,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
 }
 
 // 非流式：聚合上游流成 Responses API 非流式对象
-async function responsesToNonStream(upstreamBody, mc, clientTools = []) {
+async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPassthrough = false) {
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   let buf = "", model = "", outputText = "", reasoning = "", usage = null;
@@ -2885,7 +2891,7 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = []) {
         const delta = choice.delta || {};
         if (delta.content) outputText += delta.content;
         if (delta.reasoning_content) reasoning += delta.reasoning_content;
-        if (Array.isArray(delta.tool_calls)) {
+        if (Array.isArray(delta.tool_calls) && !dsmlPassthrough) {
           for (const tc of delta.tool_calls) {
             if (!tc || typeof tc !== "object") continue;
             const ti = tc.index ?? 0;
@@ -2914,10 +2920,22 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = []) {
   resp.status = "completed";
   resp.model = model || mc.id;
   resp.output = [];
+  // 去重集合：XML 与原生工具调用按 (name, args) 合并，防止重复执行
+  const seenTools = new Set();
+  const pushToolItem = (id, callId, name, args) => {
+    const key = name + "::" + args;
+    if (seenTools.has(key)) return;
+    seenTools.add(key);
+    if (name === "exec") {
+      resp.output.push({ id, type: "custom_tool_call", status: "completed", call_id: callId, name, input: args });
+    } else {
+      resp.output.push({ id, type: "function_call", status: "completed", call_id: callId, name, arguments: args });
+    }
+  };
   if (outputText || reasoning) {
     const raw = outputText || reasoning;
-    const parsed = parseXmlToolCallsAndCommentary(raw, clientTools);
-    const text = parsed.cleanedText || parsed.commentary;
+    const parsed = dsmlPassthrough ? { cleanedText: raw, toolCalls: [], commentary: "" } : parseXmlToolCallsAndCommentary(raw, clientTools);
+    const text = dsmlPassthrough ? parsed.cleanedText : (parsed.cleanedText || parsed.commentary);
     if (text) {
       resp.output.push({
         id: "msg_" + Math.random().toString(36).slice(2, 10),
@@ -2926,33 +2944,24 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = []) {
       });
     }
     for (const tc of parsed.toolCalls) {
-      if (tc.name === "exec") {
-        resp.output.push({
-          id: "fc_" + Math.random().toString(36).slice(2, 10),
-          type: "custom_tool_call",
-          status: "completed",
-          call_id: tc.id,
-          name: tc.name,
-          input: tc.arguments,
-        });
-      } else {
-        resp.output.push({
-          id: "fc_" + Math.random().toString(36).slice(2, 10),
-          type: "function_call",
-          status: "completed",
-          call_id: tc.id,
-          name: tc.name,
-          arguments: tc.arguments,
-        });
-      }
+      pushToolItem("fc_" + Math.random().toString(36).slice(2, 10), tc.id, tc.name, tc.arguments);
     }
   }
   for (const item of toolItems.values()) {
-    if (item.name === "exec") {
-      resp.output.push({ id: item.id, type: "custom_tool_call", status: "completed", call_id: item.callId, name: item.name, input: item.args });
-    } else {
-      resp.output.push({ id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args });
+    // 原生工具调用同样净化（exec_command/裸 JSON → 客户端协议）
+    let cleanArgs = item.args;
+    let cleanName = item.name;
+    try {
+      const rawObj = typeof item.args === "string" && item.args.startsWith("{") ? JSON.parse(item.args) : item.args;
+      const s = sanitizeToolPayload(item.name, rawObj, clientTools);
+      cleanName = s.fnName;
+      cleanArgs = typeof s.args === "string" ? s.args : JSON.stringify(s.args);
+    } catch {
+      const s = sanitizeToolPayload(item.name, { command: item.args }, clientTools);
+      cleanName = s.fnName;
+      cleanArgs = typeof s.args === "string" ? s.args : JSON.stringify(s.args);
     }
+    pushToolItem(item.id, item.callId, cleanName, cleanArgs);
   }
   resp.usage = chatUsageToResponsesUsage(usage);
   return resp;
