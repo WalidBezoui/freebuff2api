@@ -9,6 +9,8 @@ freebuff_tools/freebuff_credentials.json
 credentials/
 __pycache__/
 test/
+!test/fixtures/
+!test/fixtures/**
 
 # 部署脚本含凭据读取逻辑，仅本地使用，不推送
 /credentials.yaml
