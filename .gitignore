@@ -38,3 +38,6 @@ logs/
 
 # 本地额度验证脚本，仅本地使用
 freebuff_tools/test_extract_freebuff_quota.py
+
+# local debug scratch files
+scratch/

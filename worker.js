@@ -1328,6 +1328,9 @@ function responsesToChatParams(params, mc) {
       chat.tool_choice = "auto";
     }
   }
+  // 记录客户端原始工具集，供下游 sanitizeToolPayload 决定回传 function_call 还是 custom_tool_call。
+  // _clientTools 不是 UPSTREAM_KEYS，buildUpstreamPayload 不会把它转发给上游。
+  chat._clientTools = Array.isArray(params.tools) ? params.tools : [];
   chat.model = mc.id;
   chat.messages = responsesInputToMessages(params.input, params.instructions);
   return chat;
@@ -1674,13 +1677,53 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       if (isStream) {
         const { readable, writable } = new TransformStream();
         if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, null, chatParams?._clientTools || []);
-        else pipeUpstreamToClient(resp.body, writable);
+        else {
+          const sanitize = chatShouldSanitize(chatParams);
+          pipeUpstreamToClient(resp.body, writable, null, { sanitize, clientTools: chatParams?._clientTools || chatParams?.tools || [] });
+        }
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
 
       if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc, chatParams?._clientTools || []), 200);
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
+      // 非流式 chat 同样过滤 DSML/XML：清理 content，并统一净化/合并原生+XML 工具调用
+      if (chatShouldSanitize(chatParams) && agg?.choices?.[0]?.message) {
+        const msg = agg.choices[0].message;
+        const clientTools = chatParams?._clientTools || chatParams?.tools || [];
+        const raw = msg.content || "";
+        if (raw) {
+          const parsed = parseXmlToolCallsAndCommentary(raw, clientTools);
+          msg.content = parsed.cleanedText || "";
+        }
+        const cleaned = [];
+        const seen = new Set();
+        for (const tc of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
+          const fn = tc.function || {};
+          let s;
+          try {
+            const rawObj = typeof fn.arguments === "string" && fn.arguments.startsWith("{") ? JSON.parse(fn.arguments) : fn.arguments;
+            s = sanitizeToolPayload(fn.name, rawObj, clientTools);
+          } catch {
+            s = sanitizeToolPayload(fn.name, { command: fn.arguments }, clientTools);
+          }
+          const key = s.fnName + "::" + s.args;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          cleaned.push({ id: tc.id, type: "function", function: { name: s.fnName, arguments: typeof s.args === "string" ? s.args : JSON.stringify(s.args) } });
+        }
+        if (raw) {
+          const parsed = parseXmlToolCallsAndCommentary(raw, clientTools);
+          for (const tc of parsed.toolCalls) {
+            const key = tc.name + "::" + tc.arguments;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            cleaned.push({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.arguments } });
+          }
+        }
+        msg.tool_calls = cleaned.length ? cleaned : undefined;
+        if (cleaned.length) agg.choices[0].finish_reason = "tool_calls";
+      }
       return jsonResponse(agg, 200);
     } catch (e) {
       console.error("[" + mode + "]", e);
@@ -1894,13 +1937,97 @@ function unwrapData(obj) {
   return obj;
 }
 
-// 流式：把上游 SSE 剥 {data:...} 包装后透传
-function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
+// 判断 chat 客户端是否走 OpenAI 原生工具协议（需要过滤 DSML、回传原生 tool_calls）。
+// DSML 客户端（DeepSeek 原生）依赖 content 里的 XML 标签，绝不拦截。
+function chatShouldSanitize(chatParams) {
+  if (!chatParams || typeof chatParams !== "object") return true;
+  if (chatParams.metadata && (chatParams.metadata.freebuff_dsml === true || chatParams.metadata.freebuff_dsml === "true")) return false;
+  const tools = Array.isArray(chatParams.tools) ? chatParams.tools : [];
+  if (tools.length === 0) return true; // 无工具 → 只做文本过滤，DSML 客户端无工具时也不依赖标签
+  const execLike = new Set(["exec_command", "exec", "shell_command", "bash", "run_command", "cmd", "terminal", "shell"]);
+  return tools.some((t) => {
+    if (!t || typeof t !== "object") return false;
+    const n = (t.function?.name || t.name || "").toLowerCase();
+    return execLike.has(n);
+  });
+}
+
+// 流式：把上游 SSE 剥 {data:...} 包装后透传。
+// sanitize=true 时（OpenAI 原生工具客户端）：实时过滤 DSML/XML 标签，
+// 并把 XML/原生工具调用统一改写成原生 delta.tool_calls（去重 + 参数净化）。
+function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) {
+  const sanitize = !!options.sanitize;
+  const clientTools = Array.isArray(options.clientTools) ? options.clientTools : [];
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
-  let buf = "";
+  const chunkId = "chatcmpl_" + Math.random().toString(36).slice(2, 12);
+  let buf = "", model = "", usage = null, finishReason = null;
+
+  const sendObj = (obj) => writer.write(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
+  const emitChunk = (delta, extra = {}) => sendObj({
+    id: chunkId, object: "chat.completion.chunk", model,
+    choices: [{ index: 0, delta, ...extra }],
+  });
+
+  // sanitize 模式状态
+  const xmlFilter = sanitize ? new StreamingXmlFilter() : null;
+  let rawTextAccumulator = "";
+  const nativeToolItems = new Map(); // index -> { id, callId, name, args }
+
+  const accumulateNativeTools = (deltaToolCalls) => {
+    for (const tc of deltaToolCalls) {
+      if (!tc || typeof tc !== "object") continue;
+      const ti = tc.index ?? 0;
+      let item = nativeToolItems.get(ti);
+      if (!item) {
+        const fn = tc.function || {};
+        item = {
+          id: tc.id || ("call_" + Math.random().toString(36).slice(2, 10)),
+          name: fn.name || "",
+          args: "",
+        };
+        nativeToolItems.set(ti, item);
+      }
+      const fn = tc.function || {};
+      if (fn.name && !item.name) item.name = fn.name;
+      if (fn.arguments) item.args += fn.arguments;
+    }
+  };
+
+  const finalizeToolCalls = async () => {
+    const calls = [];
+    for (const it of nativeToolItems.values()) {
+      try {
+        const rawObj = typeof it.args === "string" ? (it.args.startsWith("{") ? JSON.parse(it.args) : it.args) : (it.args || {});
+        const s = sanitizeToolPayload(it.name, rawObj, clientTools);
+        calls.push({ id: it.id, type: "function", function: { name: s.fnName, arguments: typeof s.args === "string" ? s.args : JSON.stringify(s.args) } });
+      } catch {
+        const s = sanitizeToolPayload(it.name, { command: it.args }, clientTools);
+        calls.push({ id: it.id, type: "function", function: { name: s.fnName, arguments: typeof s.args === "string" ? s.args : JSON.stringify(s.args) } });
+      }
+    }
+    if (rawTextAccumulator) {
+      const parsed = parseXmlToolCallsAndCommentary(rawTextAccumulator, clientTools);
+      for (const tc of parsed.toolCalls) {
+        calls.push({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.arguments } });
+      }
+    }
+    // 去重：同一 (name, arguments) 只发一次（上游可能同时给 native + XML 两份）
+    const seen = new Set();
+    const uniq = [];
+    for (const c of calls) {
+      const key = c.function.name + "::" + c.function.arguments;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniq.push(c);
+    }
+    if (uniq.length === 0) return false;
+    await emitChunk({ tool_calls: uniq });
+    return true;
+  };
+
   (async () => {
     try {
       while (true) {
@@ -1915,17 +2042,52 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
             if (payload === "" || payload === "[DONE]") { await writer.write(encoder.encode(line + "\n\n")); continue; }
             try {
               const normalized = unwrapData(JSON.parse(payload));
-              await writer.write(encoder.encode("data: " + JSON.stringify(normalized) + "\n\n"));
+              if (!sanitize) {
+                await writer.write(encoder.encode("data: " + JSON.stringify(normalized) + "\n\n"));
+                continue;
+              }
+              const choice = normalized?.choices?.[0];
+              if (normalized.model) model = normalized.model;
+              if (normalized.usage) usage = normalized.usage;
+              const delta = choice?.delta || {};
+              if (delta.content) {
+                rawTextAccumulator += delta.content;
+                const filtered = xmlFilter.feed(delta.content);
+                if (filtered) await emitChunk({ content: filtered });
+              }
+              if (Array.isArray(delta.tool_calls)) accumulateNativeTools(delta.tool_calls);
+              if (choice?.finish_reason) finishReason = choice.finish_reason;
             } catch { await writer.write(encoder.encode(line + "\n")); }
           } else {
             await writer.write(encoder.encode(line + "\n"));
           }
         }
       }
-    } catch {}
+
+      if (sanitize) {
+        const flushed = xmlFilter.flush();
+        if (flushed) await emitChunk({ content: flushed });
+        const parsed = parseXmlToolCallsAndCommentary(rawTextAccumulator, clientTools);
+        const hasCalls = nativeToolItems.size > 0 || parsed.toolCalls.length > 0;
+        let fr = finishReason || "stop";
+        if (hasCalls && await finalizeToolCalls()) fr = "tool_calls";
+        const finalChunk = { id: chunkId, object: "chat.completion.chunk", model, choices: [{ index: 0, delta: {}, finish_reason: fr }] };
+        if (usage) finalChunk.usage = usage;
+        await sendObj(finalChunk);
+      }
+      await writer.write(encoder.encode("data: [DONE]\n\n"));
+    } catch (err) {
+      // R1：绝不让客户端无声挂起——至少告知错误再关闭
+      try {
+        await writer.write(encoder.encode("data: " + JSON.stringify({ error: { message: String(err?.message || err), type: "upstream_stream_error" } }) + "\n\n"));
+        await writer.write(encoder.encode("data: [DONE]\n\n"));
+      } catch {}
+    }
     finally {
       try { if (onComplete) await onComplete(); } catch {}
       try { await writer.close(); } catch {}
+      // R2：客户端断开/异常时取消上游流，尽快释放 session/额度
+      try { await reader.cancel().catch(() => {}); } catch {}
     }
   })();
 }
@@ -1935,6 +2097,7 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   let buf = "", content = "", reasoning = "", finishReason = null, model = "", id = "", usage = null;
+  const toolCalls = new Map(); // 上游 tool_calls index → {id, type, function:{name, arguments}}
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -1952,6 +2115,25 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
         const delta = choice.delta || {};
         if (delta.content) content += delta.content;
         if (delta.reasoning_content) reasoning += delta.reasoning_content;
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            if (!tc || typeof tc !== "object") continue;
+            const ti = tc.index ?? 0;
+            let item = toolCalls.get(ti);
+            if (!item) {
+              const fn = tc.function || {};
+              item = {
+                id: tc.id || ("call_" + Math.random().toString(36).slice(2, 10)),
+                type: "function",
+                function: { name: fn.name || "", arguments: "" },
+              };
+              toolCalls.set(ti, item);
+            }
+            const fn = tc.function || {};
+            if (fn.name && !item.function.name) item.function.name = fn.name;
+            if (fn.arguments) item.function.arguments += fn.arguments;
+          }
+        }
         if (choice.finish_reason) finishReason = choice.finish_reason;
         if (obj.id) id = obj.id;
         if (obj.model) model = obj.model;
@@ -1960,6 +2142,10 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
     }
   }
   const msg = { role: "assistant", content };
+  if (toolCalls.size > 0) {
+    msg.tool_calls = Array.from(toolCalls.values());
+    if (!content && !reasoning && finishReason !== "tool_calls") finishReason = "tool_calls";
+  }
   if (reasoning && !content) { msg.content = reasoning; msg.reasoning_used_as_content = true; }
   else if (reasoning) msg.reasoning_content = reasoning;
   return {
@@ -1970,6 +2156,20 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   };
 }
 
+// 兜底：任何残留的 XML/DSML 标签与实体引用都必须从命令值里剥掉，
+// 否则模型吐出的 <antml:parameter>…</antml:parameter> 之类会被原样交给客户端执行。
+function stripResidualXml(value) {
+  if (typeof value !== "string") return value;
+  return value
+    .replace(/<[^>]*>/g, "")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&amp;/gi, "&")
+    .trim();
+}
+
 function sanitizeToolPayload(rawFnName, args, clientTools = []) {
   let hasExecCommand = false;
   let hasExec = false;
@@ -1978,7 +2178,7 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
     for (const t of clientTools) {
       const n = (t?.name || t?.function?.name || "").toLowerCase();
       if (n === "exec_command") hasExecCommand = true;
-      if (n === "exec") hasExec = true;
+      if (n === "exec" || t?.type === "custom" || t?.type === "local_shell") hasExec = true;
       if (n === "shell_command") hasShellCommand = true;
     }
   }
@@ -2003,12 +2203,13 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
     fnName = "web_search";
   }
 
-  const cmdVal = typeof args === "string" ? args
+  // 命令值来源优先级：command > cmd > input > code；字符串参数视为裸命令。
+  const cmdVal = stripResidualXml(typeof args === "string" ? args
     : typeof args?.command === "string" ? args.command
     : typeof args?.cmd === "string" ? args.cmd
     : typeof args?.input === "string" ? args.input
     : typeof args?.code === "string" ? args.code
-    : "";
+    : "");
 
   if (fnName === "exec") {
     if (/^\s*(text\(|await\s+tools\.|tools\.|const\s+|let\s+|\/\/\s*@exec)/.test(cmdVal)) {
@@ -2017,10 +2218,15 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
       }
       return { fnName: "exec", args: cmdVal };
     }
+    // 空命令兜底：绝不把 command:"" 交出去执行（Codex 会报错），
+    // 用无害的 echo 产生空 stdout + exit 0。
+    if (!cmdVal || cmdVal.length === 0) {
+      return { fnName: "exec", args: `text(await tools.shell_command({ command: "echo ''" }));` };
+    }
     return { fnName: "exec", args: `text(await tools.shell_command({ command: ${JSON.stringify(cmdVal)} }));` };
   }
 
-  if (!args || typeof args !== "object") return { fnName, args };
+  if (!args || typeof args !== "object") return { fnName, args: cmdVal };
   const clean = {};
   if (fnName === "exec_command") {
     clean.cmd = cmdVal;
@@ -2033,11 +2239,11 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
     return { fnName, args: clean };
   }
   if (fnName === "apply_patch") {
-    clean.patch = typeof args.patch === "string" ? args.patch : typeof args.input === "string" ? args.input : "";
+    clean.patch = stripResidualXml(typeof args.patch === "string" ? args.patch : typeof args.input === "string" ? args.input : "");
     return { fnName: "apply_patch", args: clean };
   }
   if (fnName === "web_search" || fnName === "fetch_web_search") {
-    clean.query = typeof args.query === "string" ? args.query : typeof args.input === "string" ? args.input : "";
+    clean.query = stripResidualXml(typeof args.query === "string" ? args.query : typeof args.input === "string" ? args.input : "");
     return { fnName: "web_search", args: clean };
   }
   return { fnName, args };
@@ -2226,15 +2432,23 @@ function getVisibleCleanText(rawText) {
   if (!rawText || typeof rawText !== "string") return "";
   const filter = new StreamingXmlFilter();
   const out = filter.feed(rawText);
-  return out + filter.flush();
+  const text = out + filter.flush();
+  // 折叠被剥掉工具块后残留的连续空行（如 </exec_command> 后多出的 \n\n）
+  return text.replace(/\n{3,}/g, "\n\n");
+}
+
+// 统一所有 DSML 前缀：<｜｜DSML｜｜invoke> / <antml:invoke> / <prefix:invoke> → <invoke>，
+// 让后续 invoke/parameter 等解析表达式只需处理一种形态。
+function normalizeTagPrefixes(rawText) {
+  if (typeof rawText !== "string") return rawText;
+  return rawText.replace(/<(\/?)(?:[^\w\s<>]*DSML[^\w\s<>]*)?(?:[a-zA-Z0-9_]+:)?([a-zA-Z0-9_]+)/gi,
+    (m, slash, tag) => `<${slash}${tag}`);
 }
 
 function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
   if (!rawText || typeof rawText !== "string") return { cleanedText: rawText || "", commentary: "", toolCalls: [] };
   
-  let cleanedText = rawText.replace(/<\/?(?:[^\w\s<>]*DSML[^\w\s<>]*)?([a-zA-Z0-9_]+)/gi, (m, tag) => {
-    return m.startsWith("</") ? `</${tag}` : `<${tag}`;
-  });
+  let cleanedText = normalizeTagPrefixes(rawText);
   
   // Extract attempt_completion / result content directly into cleanedText (this is the final answer)
   cleanedText = cleanedText.replace(/<attempt_completion[^>]*>([\s\S]*?)<\/attempt_completion>/gi, (match, inner) => {
@@ -2256,16 +2470,16 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
   const invokeRegex = /<(?:[a-zA-Z0-9_]+:)?(?:invoke|tool_call)\s+name=["']([^"']+)["']>([\s\S]*?)<\/(?:[a-zA-Z0-9_]+:)?(?:invoke|tool_call)>/gi;
   let match;
   while ((match = invokeRegex.exec(cleanedText)) !== null) {
-    const fnName = match[1].trim();
+    const fnName = match[1].replace(/^[a-zA-Z0-9_]+:/, "").trim();
     const body = match[2];
     let args = {};
-    const paramRegex = /<parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)(?:<\/parameter>|(?=<parameter|<\/(?:[a-zA-Z0-9_]+:)?(?:invoke|tool_call)|$))/gi;
+    const paramRegex = /<(?:[a-zA-Z0-9_]+:)?parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)(?:<\/(?:[a-zA-Z0-9_]+:)?parameter>|(?=<(?:[a-zA-Z0-9_]+:)?parameter|<\/(?:[a-zA-Z0-9_]+:)?(?:invoke|tool_call)|$))/gi;
     let pMatch;
     let hasParams = false;
     while ((pMatch = paramRegex.exec(body)) !== null) {
       hasParams = true;
       const pName = pMatch[1].trim();
-      let pVal = pMatch[2].trim();
+      let pVal = stripResidualXml(pMatch[2]).trim();
       try { pVal = JSON.parse(pVal); } catch {}
       args[pName] = pVal;
     }
@@ -2273,9 +2487,9 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
       try {
         const parsed = JSON.parse(body.trim());
         if (typeof parsed === "object" && parsed !== null) Object.assign(args, parsed);
-        else args["command"] = body.trim();
+        else args["command"] = stripResidualXml(body);
       } catch {
-        if (body.trim()) args["command"] = body.trim();
+        if (body.trim()) args["command"] = stripResidualXml(body);
       }
     }
     
@@ -2288,29 +2502,29 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
   }
 
   // Also support direct tool tags like <exec_command><cmd>...</cmd></exec_command> or <exec><command>...</command></exec>
-  const directToolRegex = /<(exec_command|exec|bash|shell_command|run_command|apply_patch|read_file|write_file)>([\s\S]*?)<\/\1>/gi;
+  const directToolRegex = /<(?:[a-zA-Z0-9_]+:)?(exec_command|exec|bash|shell_command|run_command|apply_patch|read_file|write_file)>([\s\S]*?)<\/(?:[a-zA-Z0-9_]+:)?\1>/gi;
   let dMatch;
   while ((dMatch = directToolRegex.exec(cleanedText)) !== null) {
     const fnName = dMatch[1].trim();
     const body = dMatch[2];
     let args = {};
-    const cmdMatch = /<(?:cmd|command)>([\s\S]*?)<\/(?:cmd|command)>/i.exec(body);
-    const patchMatch = /<(?:patch)>([\s\S]*?)<\/(?:patch)>/i.exec(body);
-    const pathMatch = /<(?:path|file|filepath)>([\s\S]*?)<\/(?:path|file|filepath)>/i.exec(body);
-    const contentMatch = /<(?:content)>([\s\S]*?)<\/(?:content)>/i.exec(body);
+    const cmdMatch = /<(?:[a-zA-Z0-9_]+:)?(?:cmd|command)>([\s\S]*?)<\/(?:[a-zA-Z0-9_]+:)?(?:cmd|command)>/i.exec(body);
+    const patchMatch = /<(?:[a-zA-Z0-9_]+:)?patch>([\s\S]*?)<\/(?:[a-zA-Z0-9_]+:)?patch>/i.exec(body);
+    const pathMatch = /<(?:[a-zA-Z0-9_]+:)?(?:path|file|filepath)>([\s\S]*?)<\/(?:[a-zA-Z0-9_]+:)?(?:path|file|filepath)>/i.exec(body);
+    const contentMatch = /<(?:[a-zA-Z0-9_]+:)?content>([\s\S]*?)<\/(?:[a-zA-Z0-9_]+:)?content>/i.exec(body);
 
-    if (cmdMatch) args.command = cmdMatch[1].trim();
-    else if (patchMatch) args.patch = patchMatch[1].trim();
+    if (cmdMatch) args.command = stripResidualXml(cmdMatch[1]).trim();
+    else if (patchMatch) args.patch = stripResidualXml(patchMatch[1]).trim();
     else if (pathMatch) {
-      args.path = pathMatch[1].trim();
-      if (contentMatch) args.content = contentMatch[1];
+      args.path = stripResidualXml(pathMatch[1]).trim();
+      if (contentMatch) args.content = stripResidualXml(contentMatch[1]);
     } else {
       try {
         const parsed = JSON.parse(body.trim());
         if (typeof parsed === "object" && parsed !== null) Object.assign(args, parsed);
-        else args["command"] = body.trim();
+        else args["command"] = stripResidualXml(body);
       } catch {
-        if (body.trim()) args["command"] = body.trim();
+        if (body.trim()) args["command"] = stripResidualXml(body);
       }
     }
 
@@ -2392,12 +2606,13 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
   const respId = "resp_" + Math.random().toString(36).slice(2, 10);
   const createdAt = Math.floor(Date.now() / 1000);
   let buf = "", model = "", usage = null;
+  let nextOutputIndex = 0;
   const send = (obj) => writer.write(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
 
   let contentItem = null;
   let rawTextAccumulator = "";
   const xmlFilter = new StreamingXmlFilter();
-  const nativeToolItems = new Map(); // 上游原生 tool_calls index → {id, callId, name, args}
+  const nativeToolItems = new Map(); // 上游原生 tool_calls index → {id, callId, name, args, outputIndex, started}
 
   (async () => {
     try {
@@ -2422,28 +2637,35 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
             if (obj.model) model = obj.model;
             if (obj.usage) usage = obj.usage;
 
-            // 原生工具调用增量（chat 格式 delta.tool_calls[]）
+            // 原生工具调用增量（chat 格式 delta.tool_calls[]）：实时上屏 output_item.added
             if (Array.isArray(delta.tool_calls)) {
               for (const tc of delta.tool_calls) {
                 if (!tc || typeof tc !== "object") continue;
                 const ti = tc.index ?? 0;
                 let item = nativeToolItems.get(ti);
                 if (!item) {
+                  const rawName = tc.function?.name || "";
+                  // 名称与类型即时确定（参数值不影响名称映射），保证 added 事件的 type/name 与最终一致
+                  const nameInfo = sanitizeToolPayload(rawName, {}, clientTools);
+                  const isCustom = nameInfo.fnName === "exec";
                   item = {
                     kind: "function_call",
                     id: "fc_" + Math.random().toString(36).slice(2, 10),
                     callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
-                    name: tc.function?.name || "",
+                    name: nameInfo.fnName,
                     args: "",
+                    outputIndex: nextOutputIndex++,
                     started: false,
                   };
                   nativeToolItems.set(ti, item);
+                  const addedItem = isCustom
+                    ? { id: item.id, type: "custom_tool_call", status: "in_progress", call_id: item.callId, name: item.name, input: "" }
+                    : { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" };
+                  await send({ type: "response.output_item.added", output_index: item.outputIndex, item: addedItem });
+                  item.started = true;
                 }
                 const fn = tc.function || {};
-                if (fn.name && !item.name) item.name = fn.name;
-                if (fn.arguments) {
-                  item.args += fn.arguments;
-                }
+                if (fn.arguments) item.args += fn.arguments;
               }
             }
 
@@ -2456,26 +2678,29 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
                   contentItem = {
                     kind: "message",
                     id: "msg_" + Math.random().toString(36).slice(2, 10),
-                    outputIndex: 0,
+                    outputIndex: nextOutputIndex++,
                     text: "",
                     contentIndex: 0,
                     started: true,
                   };
-                  await send({ type: "response.output_item.added", output_index: 0, item: { id: contentItem.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
-                  await send({ type: "response.content_part.added", item_id: contentItem.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+                  await send({ type: "response.output_item.added", output_index: contentItem.outputIndex, item: { id: contentItem.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
+                  await send({ type: "response.content_part.added", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
                 }
                 contentItem.text += newDelta;
-                await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: 0, content_index: 0, delta: newDelta });
+                await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: 0, delta: newDelta });
               }
             }
-          } catch {}
+          } catch (err) {
+            // 解析/发送失败（含客户端断连）→ 交给外层统一收尾
+            throw err;
+          }
         }
       }
 
       const flushed = xmlFilter.flush();
       if (flushed && contentItem) {
         contentItem.text += flushed;
-        await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: 0, content_index: 0, delta: flushed });
+        await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: 0, delta: flushed });
       }
 
       // 收尾：统一解析 XML tool calls 和 commentary
@@ -2503,7 +2728,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         const msgItem = {
           kind: "message",
           id: "msg_" + Math.random().toString(36).slice(2, 10),
-          outputIndex: 0,
+          outputIndex: nextOutputIndex++,
           text: textToUse,
           contentIndex: 0,
           started: false,
@@ -2516,40 +2741,63 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       }
 
       for (const tc of parsed.toolCalls) {
-        const tcItem = {
+        finalItems.push({
           kind: "function_call",
           id: "fc_" + Math.random().toString(36).slice(2, 10),
-          outputIndex: 0,
+          outputIndex: nextOutputIndex++,
           callId: tc.id,
           name: tc.name,
           args: tc.arguments,
           started: false,
-        };
-        finalItems.push(tcItem);
+        });
       }
 
       if (finalItems.length === 0) {
         // Codex requires at least one output with non-empty text OR a tool call.
         // Use raw stripped text as last resort; single space prevents rejection.
         const fallbackText = rawTextAccumulator.replace(/<[^>]*>/g, "").trim() || " ";
-        const fallbackItem = {
+        finalItems.push({
           kind: "message",
           id: "msg_" + Math.random().toString(36).slice(2, 10),
-          outputIndex: 0,
+          outputIndex: nextOutputIndex++,
           text: fallbackText,
           contentIndex: 0,
           started: false,
-        };
-        finalItems.push(fallbackItem);
+        });
       }
 
-      // 重新分配连续的 0-based outputIndex (0, 1, 2, ...)
-      finalItems.forEach((item, idx) => {
-        item.outputIndex = idx;
-      });
+      // 按输出顺序排列（live 阶段已分配 outputIndex）
+      finalItems.sort((a, b) => a.outputIndex - b.outputIndex);
+
+      // B5：先净化全部工具项，再按 (name, args) 去重，防止上游同时给 native+XML 两份导致命令重复执行
+      const seenTools = new Set();
+      const toolFinalize = async (item) => {
+        if (item.kind !== "function_call") return true;
+        let cleanArgs = item.args;
+        try {
+          const rawObj = typeof item.args === "string" ? (item.args.startsWith("{") ? JSON.parse(item.args) : item.args) : (item.args || {});
+          const sanitized = sanitizeToolPayload(item.name, rawObj, clientTools);
+          item.name = sanitized.fnName;
+          cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
+        } catch {
+          const sanitized = sanitizeToolPayload(item.name, { command: item.args }, clientTools);
+          item.name = sanitized.fnName;
+          cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
+        }
+        item.args = cleanArgs;
+        const key = item.name + "::" + item.args;
+        if (seenTools.has(key)) return false;
+        seenTools.add(key);
+        return true;
+      };
+      const keptItems = [];
+      for (const item of finalItems) {
+        if (item.kind === "function_call" && !(await toolFinalize(item))) continue;
+        keptItems.push(item);
+      }
 
       // 按出现顺序输出每个输出项的完成事件
-      for (const item of finalItems) {
+      for (const item of keptItems) {
         if (item.kind === "message") {
           // Safety guard: Codex rejects empty output_text. Ensure at least one non-whitespace char.
           if (!item.text || !item.text.trim()) item.text = " ";
@@ -2562,19 +2810,6 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
           await send({ type: "response.content_part.done", item_id: item.id, output_index: item.outputIndex, content_index: 0, part });
           await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "completed", role: "assistant", content: [part] } });
         } else {
-          let cleanArgs = item.args;
-          try {
-            const rawObj = typeof item.args === "string" ? (item.args.startsWith("{") ? JSON.parse(item.args) : item.args) : (item.args || {});
-            const sanitized = sanitizeToolPayload(item.name, rawObj, clientTools);
-            item.name = sanitized.fnName;
-            cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
-          } catch {
-            const sanitized = sanitizeToolPayload(item.name, { command: item.args }, clientTools);
-            item.name = sanitized.fnName;
-            cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
-          }
-          item.args = cleanArgs;
-
           const isCustom = item.name === "exec";
           if (!item.started) {
             const addedItem = isCustom
@@ -2584,12 +2819,12 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
           }
 
           if (isCustom) {
-            await send({ type: "response.custom_tool_call_input.delta", item_id: item.id, output_index: item.outputIndex, delta: cleanArgs });
-            await send({ type: "response.custom_tool_call_input.done", item_id: item.id, output_index: item.outputIndex, input: cleanArgs });
+            await send({ type: "response.custom_tool_call_input.delta", item_id: item.id, output_index: item.outputIndex, delta: item.args });
+            await send({ type: "response.custom_tool_call_input.done", item_id: item.id, output_index: item.outputIndex, input: item.args });
             await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "custom_tool_call", status: "completed", call_id: item.callId, name: item.name, input: item.args } });
           } else {
-            await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: cleanArgs });
-            await send({ type: "response.function_call_arguments.done", item_id: item.id, output_index: item.outputIndex, arguments: cleanArgs });
+            await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: item.args });
+            await send({ type: "response.function_call_arguments.done", item_id: item.id, output_index: item.outputIndex, arguments: item.args });
             await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args } });
           }
         }
@@ -2598,7 +2833,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       const resp = responsesBase(mc, respId, createdAt);
       resp.status = "completed";
       resp.model = model || mc.id;
-      resp.output = finalItems.map((item) => {
+      resp.output = keptItems.map((item) => {
         if (item.kind === "message") {
           return { id: item.id, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: item.text, annotations: [] }] };
         }
@@ -2611,9 +2846,18 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       await send({ type: "response.completed", response: resp });
     } catch (err) {
       console.error("[pipeUpstreamToResponsesStream error]", err);
+      // R1：流中途出错时告知客户端，绝不无声挂起
+      try {
+        const failed = responsesBase(mc, respId, createdAt);
+        failed.status = "failed";
+        failed.error = { code: "upstream_stream_error", message: String(err?.message || err) };
+        await send({ type: "response.failed", response: failed });
+      } catch {}
     } finally {
       try { if (onComplete) await onComplete(); } catch {}
       try { await writer.close(); } catch {}
+      // R2：无论成败都取消上游流，尽快释放 session/额度
+      try { await reader.cancel().catch(() => {}); } catch {}
     }
   })();
 }
