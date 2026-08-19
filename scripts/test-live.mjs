@@ -73,7 +73,8 @@ async function readSSE(res) {
   const events = await readSSE(res);
   const completed = events.find((e) => e.type === "response.completed");
   const text = (completed?.response?.output || []).map((o) => o.content?.[0]?.text || "").join("");
-  check("L2 responses text 200/completed", res.status === 200 && completed?.response?.status === "completed", JSON.stringify(events[0]).slice(0, 200));
+  const detail = events[0] ? JSON.stringify(events[0]).slice(0, 200) : "status " + res.status + " (zero SSE events)";
+  check("L2 responses text 200/completed", res.status === 200 && completed?.response?.status === "completed", detail);
   check("L2 model answered PING-OK", /PING-OK/i.test(text), text.slice(0, 200));
   check("L2 no XML leak", !JSON.stringify(events).includes("<"), "");
 }
@@ -180,7 +181,8 @@ async function readSSE(res) {
   const all = JSON.stringify(events);
   const completed = events.find((e) => e.type === "response.completed");
   const out = completed?.response?.output || [];
-  check("L7 DSML passthrough completed", res.status === 200 && completed?.response?.status === "completed", JSON.stringify(events[0]).slice(0, 200));
+  const detail7 = events[0] ? JSON.stringify(events[0]).slice(0, 200) : "status " + res.status;
+  check("L7 DSML passthrough completed", res.status === 200 && completed?.response?.status === "completed", detail7);
   check("L7 raw DSML/XML preserved for DSML client", all.includes("DSML") || all.includes("invoke") || all.includes("tool_calls"), "");
   check("L7 no tool item synthesized", !out.some((o) => o.type === "custom_tool_call" || o.type === "function_call"), JSON.stringify(out).slice(0, 200));
 }

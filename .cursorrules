@@ -1,0 +1,8 @@
+# Cursor Rules
+
+Please read and adhere to `AGENTS.md` before making changes.
+
+- Run offline mock tests with `npm test`.
+- Do not spam live test suites against upstream Codebuff.
+- Ensure tool calls are wrapped in `text(await tools.exec_command({ cmd: ... }))`.
+- Preserve Anthropic tool names for Claude Code.
