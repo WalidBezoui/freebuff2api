@@ -100,14 +100,19 @@ function nativeExecStream(command) {
 }
 
 const loadCapture = (name) => {
-  const p = new URL("../scratch/codex-captures/" + name + ".json", import.meta.url);
-  try {
-    const w = JSON.parse(readFileSync(p, "utf8"));
-    return { url: w.url, body: JSON.parse(w.bodyRaw) };
-  } catch (e) {
-    console.error("无法读取真实抓包 " + p.pathname + "（需先通过 scratch/capture-proxy.mjs 抓取 Codex 请求）:", e.message);
-    process.exit(2);
+  // 优先使用提交进仓库的脱敏 fixtures（CI/新克隆可直接运行）；本地新抓包优先走 scratch
+  const candidates = [
+    new URL("../test/fixtures/codex-captures/" + name + ".json", import.meta.url),
+    new URL("../scratch/codex-captures/" + name + ".json", import.meta.url),
+  ];
+  for (const p of candidates) {
+    try {
+      const w = JSON.parse(readFileSync(p, "utf8"));
+      return { url: w.url, body: JSON.parse(w.bodyRaw) };
+    } catch {}
   }
+  console.error("无法读取真实抓包 " + candidates[0].pathname + "（需先通过 scratch/capture-proxy.mjs 抓取 Codex 请求）");
+  process.exit(2);
 };
 
 const turn1 = loadCapture("002");

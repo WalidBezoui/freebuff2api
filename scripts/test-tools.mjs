@@ -444,6 +444,386 @@ async function responsesStreamTest(chunks, tools = execTools, input = [{ role: "
   check("T16 no empty patch", !!patchCall && patchCall.arguments !== '{"patch":""}', JSON.stringify(patchCall));
 }
 
+// 保留 data:[DONE] 顺序的原始 SSE 读取器（用于终止符顺序断言）
+async function readRawSSE(res) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", raw = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 1);
+      if (!line.startsWith("data:")) continue;
+      const p = line.slice(5).trim();
+      if (p === "") continue;
+      if (p === "[DONE]") { raw.push("[DONE]"); continue; }
+      try { raw.push(JSON.parse(p)); } catch { raw.push(p); }
+    }
+  }
+  return raw;
+}
+
+// ---------- T17: chat stream [DONE] 必须最后发送（tool_calls/finish/usage 在终止符之前） ----------
+{
+  currentStream = nativeExecStream("dir /b");
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/chat/completions", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: true,
+      messages: [{ role: "user", content: "list files" }],
+      tools: [{ type: "function", function: { name: "exec", parameters: { type: "object", properties: { command: { type: "string" } } } } }],
+    }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const raw = await readRawSSE(res);
+  const doneIdx = raw.lastIndexOf("[DONE]");
+  check("T17 exactly one [DONE]", raw.filter((x) => x === "[DONE]").length === 1, JSON.stringify(raw.map((x) => typeof x === "string" ? x : "obj")));
+  const tcIdx = raw.findIndex((e) => e && e.choices?.[0]?.delta?.tool_calls);
+  const finIdx = raw.findIndex((e) => e && e.choices?.[0]?.finish_reason);
+  const usageIdx = raw.findIndex((e) => e && e.usage);
+  check("T17 tool_calls before [DONE]", tcIdx >= 0 && tcIdx < doneIdx, "tc=" + tcIdx + " done=" + doneIdx);
+  check("T17 finish before [DONE]", finIdx >= 0 && finIdx < doneIdx, "fin=" + finIdx + " done=" + doneIdx);
+  check("T17 usage before [DONE]", usageIdx >= 0 && usageIdx < doneIdx, "usage=" + usageIdx + " done=" + doneIdx);
+  check("T17 finish_reason tool_calls", raw[finIdx]?.choices?.[0]?.finish_reason === "tool_calls", JSON.stringify(raw[finIdx]));
+  check("T17 tool_calls args wrapped", raw[tcIdx]?.choices?.[0]?.delta?.tool_calls?.[0]?.function?.arguments === textOf("dir /b"), JSON.stringify(raw[tcIdx]));
+}
+
+// ---------- T18: 上游流中途 {error} → chat 流不再合成假完成 ----------
+{
+  currentStream = [
+    chunk({ role: "assistant", content: "partial" }),
+    { error: { message: "account quota exhausted", type: "quota_error" } },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/chat/completions", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: true,
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ type: "function", function: { name: "exec", parameters: { type: "object", properties: {} } } }],
+    }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const raw = await readRawSSE(res);
+  const errEvent = raw.find((e) => e && e.error);
+  check("T18 error chunk forwarded", !!errEvent && String(errEvent.error?.message).includes("quota exhausted"), JSON.stringify(raw.slice(-2)));
+  check("T18 no fake finish/tool_calls after error", !raw.some((e) => e && e.choices?.[0]?.finish_reason === "tool_calls"), "");
+}
+
+// ---------- T19: exec 结果 JSON（chunk_id/output…）→ 只把 .output 回传上游 ----------
+{
+  const execResult = JSON.stringify({ chunk_id: "chk_1", exit_code: 0, original_token_count: 42, output: "42 files", session_id: "s1", wall_time_seconds: 1.2 });
+  currentStream = [{ id: "cmpl-19", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { role: "assistant", content: "Done." }, finish_reason: null }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: false, tools: execTools,
+      input: [
+        { role: "user", content: "count files" },
+        { type: "custom_tool_call", call_id: "call_19", name: "exec", input: textOf("dir /b") },
+        { type: "custom_tool_call_output", call_id: "call_19", output: [execResult] },
+        { role: "user", content: "how many?" },
+      ],
+    }),
+  });
+  const res = await worker.fetch(req, ENV);
+  await res.json();
+  const upStr = JSON.stringify(upstreamChatBodies[0]?.body);
+  check("T19 upstream gets clean output", upStr.includes("42 files"), upStr.slice(0, 400));
+  check("T19 upstream gets no chunk_id noise", !upStr.includes("chunk_id") && !upStr.includes("wall_time_seconds"), upStr.slice(0, 400));
+}
+
+// ---------- T20: extractExecCommandText 带引号 key 与对象入参 ----------
+{
+  const dsml = `<${P}invoke name="exec_command"><${P}parameter name="cmd">npm test</${P}parameter></${P}invoke>`;
+  currentStream = [chunk({ role: "assistant", content: dsml }), { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: false, tools: execTools,
+      input: [
+        { type: "custom_tool_call", call_id: "call_q1", name: "exec", input: 'text(await tools.exec_command({ "cmd": "ls -la" }));' },
+        { type: "custom_tool_call_output", call_id: "call_q1", output: "" },
+        { type: "custom_tool_call", call_id: "call_q2", name: "exec", input: { cmd: "pwd" } },
+        { type: "custom_tool_call_output", call_id: "call_q2", output: "" },
+        { role: "user", content: "go" },
+      ],
+    }),
+  });
+  const res = await worker.fetch(req, ENV);
+  await res.json();
+  const upStr = JSON.stringify(upstreamChatBodies[0]?.body);
+  check("T20 quoted-key cmd extracted", upStr.includes("ls -la"), upStr.slice(0, 400));
+  check("T20 object input cmd extracted", upStr.includes("pwd"), upStr.slice(0, 400));
+}
+
+// ---------- T21: <function_calls> 容器内的 invoke 必须被提取（不再被容器剥离吞掉） ----------
+{
+  const dsml = `<${P}function_calls><${P}invoke name="exec_command"><${P}parameter name="cmd">npm test</${P}parameter></${P}invoke></${P}function_calls>`;
+  const events = await responsesStreamTest([
+    chunk({ role: "assistant", content: "Running.\n" + dsml }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ]);
+  const done = events.filter((e) => e.type === "response.custom_tool_call_input.done");
+  check("T21 invoke inside function_calls extracted", done[0]?.input === textOf("npm test"), done[0]?.input);
+  check("T21 no XML leak", !JSON.stringify(events).includes("<"), "");
+}
+
+// ---------- T22: 非流式 responses 空输出 → " " 兜底（Codex 拒绝空 output） ----------
+{
+  currentStream = [];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "hi" }], stream: false }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const json = await res.json();
+  check("T22 empty stream still completed", res.status === 200 && json?.status === "completed", res.status + " " + json?.status);
+  check("T22 output non-empty fallback", Array.isArray(json?.output) && json.output.length === 1 && json.output[0].content?.[0]?.text === " ", JSON.stringify(json?.output));
+}
+
+// ---------- T23: 相同 (name,args) 的两个并行 native 调用都保留（live-added 项不可去重移除） ----------
+{
+  currentStream = [
+    chunk({ tool_calls: [
+      { index: 0, id: "call_a", type: "function", function: { name: "exec_command", arguments: JSON.stringify({ command: "dir /b" }) } },
+      { index: 1, id: "call_b", type: "function", function: { name: "exec_command", arguments: JSON.stringify({ command: "dir /b" }) } },
+    ] }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "list" }], tools: execTools, stream: true }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const completed = events.find((e) => e.type === "response.completed");
+  const tools = (completed?.response?.output || []).filter((o) => o.type === "custom_tool_call");
+  check("T23 both parallel same-cmd calls kept (no orphan)", tools.length === 2, JSON.stringify(tools.map((t) => t.input)));
+  const doneEvents = events.filter((e) => e.type === "response.output_item.done" && e.item?.type === "custom_tool_call");
+  check("T23 both calls got .done", doneEvents.length === 2, JSON.stringify(doneEvents.map((e) => e.item?.id)));
+}
+
+// ---------- T24: 名称晚到的首 delta：先挂起，名称到达后才决定 added/drop ----------
+{
+  const events = await responsesStreamTest([
+    chunk({ tool_calls: [{ index: 0, id: "call_x", type: "function", function: { arguments: "" } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { name: "exec_command", arguments: JSON.stringify({ command: "dir /b" }) } }] }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ]);
+  const added = events.filter((e) => e.type === "response.output_item.added" && e.item?.type === "custom_tool_call");
+  check("T24 name-less first delta still added (name arrives later)", added.length === 1 && added[0].item.name === "exec", JSON.stringify(added));
+  const completed = events.find((e) => e.type === "response.completed");
+  const tool = (completed?.response?.output || []).find((o) => o.type === "custom_tool_call");
+  check("T24 completed input correct", tool?.input === textOf("dir /b"), JSON.stringify(tool));
+}
+{
+  // 变体：名称晚到但属于未声明工具（web_search）→ 不 added、最终丢弃
+  const events = await responsesStreamTest([
+    chunk({ tool_calls: [{ index: 0, id: "call_y", type: "function", function: { arguments: "" } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { name: "web_search", arguments: JSON.stringify({ query: "x" }) } }] }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ]);
+  const added = events.filter((e) => e.type === "response.output_item.added" && e.item?.type === "function_call");
+  check("T24 undeclared late-named call never added", added.length === 0, JSON.stringify(added));
+  const completed = events.find((e) => e.type === "response.completed");
+  check("T24 completed without web_search", !(completed?.response?.output || []).some((o) => o.name === "web_search"), JSON.stringify(completed?.response?.output));
+}
+
+// ---------- T25: 尾块 usage（choices 空）不再被非流式聚合器丢弃 ----------
+{
+  currentStream = [
+    chunk({ role: "assistant", content: "plain" }),
+    { id: "cmpl-u", object: "chat.completion.chunk", choices: [], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/chat/completions", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, stream: false, messages: [{ role: "user", content: "hi" }] }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const json = await res.json();
+  check("T25 trailing usage captured (chat non-stream)", json?.usage?.total_tokens === 7, JSON.stringify(json?.usage));
+}
+{
+  currentStream = [
+    chunk({ role: "assistant", content: "plain" }),
+    { id: "cmpl-u2", object: "chat.completion.chunk", choices: [], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "hi" }], stream: false }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const json = await res.json();
+  check("T25 trailing usage captured (responses non-stream)", json?.usage?.total_tokens === 7, JSON.stringify(json?.usage));
+}
+
+// ---------- T26: Anthropic 流式：保留 Claude 声明的工具名（Bash），stop_reason=tool_use ----------
+{
+  currentStream = [
+    chunk({ role: "assistant", content: "Running" }),
+    chunk({ tool_calls: [{ index: 0, id: "call_bash", type: "function", function: { name: "Bash", arguments: JSON.stringify({ command: "ls" }) } }] }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer freebuff-default-key", "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: MODEL, stream: true, max_tokens: 100,
+      messages: [{ role: "user", content: "list files" }],
+      tools: [{ name: "Bash", description: "Run a shell command", input_schema: { type: "object", properties: { command: { type: "string" } } } }],
+    }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const raw = await readRawSSE(res);
+  const starts = raw.filter((e) => e && e.type === "content_block_start");
+  const toolBlock = starts.find((e) => e.content_block?.type === "tool_use");
+  check("T26 tool_use block emitted", !!toolBlock && toolBlock.content_block.name === "Bash", JSON.stringify(toolBlock));
+  check("T26 no Codex exec rename", !JSON.stringify(raw).includes('"exec"'), JSON.stringify(raw).slice(0, 300));
+  const delta = raw.find((e) => e && e.type === "message_delta");
+  check("T26 stop_reason tool_use", delta?.delta?.stop_reason === "tool_use", JSON.stringify(delta));
+  check("T26 message_stop present", raw.some((e) => e && e.type === "message_stop"), "");
+}
+
+// ---------- T27: Anthropic XML 路径：invoke name="Bash" 保留原名 ----------
+{
+  const dsml = `<${P}invoke name="Bash"><${P}parameter name="command">ls</${P}parameter></${P}invoke>`;
+  currentStream = [chunk({ role: "assistant", content: "Running\n" + dsml }), { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer freebuff-default-key", "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: MODEL, stream: true, max_tokens: 100,
+      messages: [{ role: "user", content: "list files" }],
+      tools: [{ name: "Bash", description: "Run a shell command", input_schema: { type: "object", properties: { command: { type: "string" } } } }],
+    }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const raw = await readRawSSE(res);
+  const toolBlock = raw.find((e) => e && e.type === "content_block_start" && e.content_block?.type === "tool_use");
+  check("T27 XML Bash preserved", !!toolBlock && toolBlock.content_block.name === "Bash", JSON.stringify(toolBlock));
+  check("T27 no XML leak", !JSON.stringify(raw).includes("DSML") && !JSON.stringify(raw).includes("<"), "");
+  const delta = raw.find((e) => e && e.type === "message_delta");
+  check("T27 stop_reason tool_use", delta?.delta?.stop_reason === "tool_use", JSON.stringify(delta));
+}
+
+// ---------- T28: stop:[] 视同未设置，必须补 cb_easp ----------
+{
+  currentStream = [{ id: "cmpl-28", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/chat/completions", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, stream: false, stop: [], messages: [{ role: "user", content: "hi" }] }),
+  });
+  const res = await worker.fetch(req, ENV);
+  await res.json();
+  const up = upstreamChatBodies[0]?.body;
+  check("T28 stop:[] -> cb_easp injected", Array.isArray(up?.stop) && up.stop[0] === '"cb_easp"', JSON.stringify(up?.stop));
+}
+
+// ---------- T29: system 数组内容无 text part → 索引 0 插入 BUFFY 前缀 ----------
+{
+  currentStream = [{ id: "cmpl-29", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/chat/completions", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: false,
+      messages: [
+        { role: "system", content: [{ type: "image_url", image_url: { url: "https://x/y.png" } }] },
+        { role: "user", content: "hi" },
+      ],
+    }),
+  });
+  const res = await worker.fetch(req, ENV);
+  await res.json();
+  const msgs = upstreamChatBodies[0]?.body?.messages;
+  const sys = msgs?.find((m) => m.role === "system");
+  check("T29 BUFFY text part inserted at index 0", Array.isArray(sys?.content) && sys.content[0]?.type === "text" && String(sys.content[0].text).startsWith("You are Buffy"), JSON.stringify(sys?.content));
+}
+
+// ---------- T30: 鉴权——未配置 key 拒绝；错误 key 拒绝；正确 key 放行 ----------
+{
+  const req = new Request("https://localhost/v1/models", { method: "GET" });
+  const resNoKey = await worker.fetch(req, { FREEBUFF_TOKEN: TOKEN });
+  check("T30 unset API key -> 401", resNoKey.status === 401, "status=" + resNoKey.status);
+  const resWrong = await worker.fetch(new Request("https://localhost/v1/models", { method: "GET", headers: { Authorization: "Bearer wrong" } }), { FREEBUFF_TOKEN: TOKEN, FREEBUFF_API_KEY: "real-key" });
+  check("T30 wrong key -> 401", resWrong.status === 401, "status=" + resWrong.status);
+  const resOk = await worker.fetch(new Request("https://localhost/v1/models", { method: "GET", headers: { Authorization: "Bearer real-key" } }), { FREEBUFF_TOKEN: TOKEN, FREEBUFF_API_KEY: "real-key" });
+  check("T30 correct key -> 200", resOk.status === 200, "status=" + resOk.status);
+}
+
+// ---------- T31: reasoning_content → response.reasoning_summary.delta ----------
+{
+  const events = await responsesStreamTest([
+    chunk({ role: "assistant", content: "Let me think", reasoning_content: "analyzing the request..." }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+  ]);
+  const reasoningDeltas = events.filter((e) => e.type === "response.reasoning_summary.delta");
+  check("T31 reasoning_summary.delta emitted", reasoningDeltas.some((e) => String(e.delta).includes("analyzing")), JSON.stringify(reasoningDeltas));
+}
+
+// ---------- T32: responsesBase 回显原请求参数 ----------
+{
+  currentStream = [{ id: "cmpl-32", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, stream: true, instructions: "be concise", temperature: 0.5, input: [{ role: "user", content: "hi" }] }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const created = events.find((e) => e.type === "response.created");
+  check("T32 instructions echoed", created?.response?.instructions === "be concise", JSON.stringify(created?.response?.instructions));
+  check("T32 temperature echoed", created?.response?.temperature === 0.5, JSON.stringify(created?.response?.temperature));
+}
+
+// ---------- T33: responses 流中途 {error} → response.failed（不合成假 completed） ----------
+{
+  currentStream = [
+    chunk({ role: "assistant", content: "partial" }),
+    { error: { message: "upstream boom", type: "api_error" } },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "hi" }], stream: true }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const failed = events.find((e) => e.type === "response.failed");
+  check("T33 response.failed emitted", !!failed && String(failed.response?.error?.message).includes("boom"), JSON.stringify(failed));
+  check("T33 no fake completed", !events.some((e) => e.type === "response.completed"), "");
+}
+
+// ---------- T34: chat 非流式中途 {error} → 502（不返回假完成） ----------
+{
+  currentStream = [
+    chunk({ role: "assistant", content: "partial" }),
+    { error: { message: "upstream boom", type: "api_error" } },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/chat/completions", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, stream: false, messages: [{ role: "user", content: "hi" }] }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const json = await res.json();
+  check("T34 non-stream upstream error -> 502", res.status === 502 && String(json?.error?.message).includes("boom"), res.status + " " + JSON.stringify(json).slice(0, 200));
+}
+
 const failed = results.filter((r) => !r.ok);
 console.log("\n=== " + (results.length - failed.length) + "/" + results.length + " passed ===");
 process.exit(failed.length ? 1 : 0);

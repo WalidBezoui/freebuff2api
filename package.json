@@ -5,7 +5,9 @@
   "private": true,
   "description": "freebuff2api-wokers v1.6.5 worker.js running in Node container",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --check worker.js && node scripts/test-tools.mjs && node scripts/test-codex-replay.mjs",
+    "test:live": "node scripts/test-live.mjs"
   },
   "engines": {
     "node": ">=20"

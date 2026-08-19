@@ -1,7 +1,6 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
-const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.8.9";
+const VERSION = "1.9.0";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 动态模型注册表：从官方 freebuff 镜像拉取模型清单
@@ -460,6 +459,10 @@ function parseAccounts(env) {
 
 const acctHealth = new Map(); // token -> { alive, state, uid, quota, checkedAt }
 const HEALTH_OBSERVATION_TTL_MS = 10 * 60 * 1000;
+// 瞬态状态（429 限流等）的观察有效期：过期后账号重新进入轮询，避免一次 429 永久剔除
+const HEALTH_TRANSIENT_TTL_MS = 4 * 60 * 1000;
+// 永久性账号状态（封禁/凭证失效等）：不做 TTL 过期，长期剔除
+const HEALTH_PERMANENT_STATES = new Set(["banned", "country_blocked", "token_invalid", "blocked", "model_locked", "ip_capped"]);
 
 // 只记录真实业务请求已经观察到的上游结果。不要在 healthz 中主动探测，
 // 也不要把网络错误/未知响应误记成账号失效。
@@ -533,10 +536,13 @@ function pickToken(env, sessionModel) {
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
 
-  // v1.6.0：跳过已探测为失效的号（alive=false）；未探测/探测失败的不跳过（避免误杀）
-  const alivePool = pool.filter((acct) => {
+  // v1.6.0：跳过已探测为失效的号（alive=false）；未探测/探测失败的不跳过（避免误杀）。
+// 瞬态失效（429 限流等）在观察 TTL 后重新纳入轮询，不再永久剔除；永久状态长期剔除。
+const alivePool = pool.filter((acct) => {
     const h = acctHealth.get(acct.token);
-    return !(h && h.alive === false);
+    if (!h || h.alive !== false) return true;
+    if (HEALTH_PERMANENT_STATES.has(h.state)) return false;
+    return Date.now() - h.checkedAt > HEALTH_TRANSIENT_TTL_MS;
   });
   const usePool = alivePool.length > 0 ? alivePool : pool; // 全失效时回退全池，让请求继续（由 429 冷却接管）
 
@@ -1063,7 +1069,12 @@ function normalizeMessages(messages) {
         if (!item.content.startsWith(BUFFY)) item.content = BUFFY + item.content;
       } else if (Array.isArray(item.content)) {
         const firstText = item.content.find((c) => c && c.type === "text" && typeof c.text === "string");
-        if (firstText && !firstText.text.startsWith(BUFFY)) firstText.text = BUFFY + firstText.text;
+        if (firstText) {
+          if (!firstText.text.startsWith(BUFFY)) firstText.text = BUFFY + firstText.text;
+        } else {
+          // 数组内容没有 text part（如图片/工具结果）：在索引 0 插入前缀文本 part
+          item.content.unshift({ type: "text", text: BUFFY });
+        }
       }
     }
     out.push(item);
@@ -1129,7 +1140,8 @@ function buildUpstreamPayload(params, mc, sess, runId) {
   payload.model = mc.upstream;
   payload.messages = normalizeMessages(params.messages);
   payload.stream = true;
-  if (!payload.stop) payload.stop = ['"cb_easp"'];
+  // 空 stop 数组（客户端显式传 stop:[]）等同未设置：必须补上官方要求的 cb_easp 终止符
+  if (!payload.stop || (Array.isArray(payload.stop) && payload.stop.length === 0)) payload.stop = ['"cb_easp"'];
   payload.provider = { data_collection: "deny" };
   // 工具集签名与 Schema 校验修复：确保每个工具都有合法的 JSON Schema (type: object)
   if (Array.isArray(payload.tools) && payload.tools.length > 0) {
@@ -1277,7 +1289,7 @@ async function handleResponses(request, env) {
   const requestedModel = params.model || DEFAULT_MODEL;
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
-  return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses");
+  return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses", { requestParams: params });
 }
 
 // Responses API 请求 → chat completions 参数（字段名/结构翻译）
@@ -1420,7 +1432,7 @@ function responsesInputToMessages(input, instructions) {
     if (item.type === "custom_tool_call") {
       const callId = item.call_id || item.id || ("call_" + Math.random().toString(36).slice(2, 10));
       // 兼容新旧 exec 写法（v0.148: tools.exec_command({cmd}) / v0.147: tools.shell_command({command})）
-      let cmdString = extractExecCommandText(typeof item.input === "string" ? item.input : "");
+      let cmdString = extractExecCommandText(item.input);
       const argsPayload = JSON.stringify({ cmd: cmdString, command: cmdString });
       const tc = {
         id: callId,
@@ -1442,12 +1454,40 @@ function responsesInputToMessages(input, instructions) {
 function extractToolOutputText(item) {
   if (!item || typeof item !== "object") return "";
   const o = item.output !== undefined ? item.output : item;
-  if (typeof o === "string") return o;
+  if (typeof o === "string") {
+    // exec 结果可能是 JSON 字符串（Codex exec_command 返回 {chunk_id, output, ...}）：只取 .output
+    const trimmed = o.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object") {
+          if (typeof parsed.output === "string") return parsed.output;
+          if (Array.isArray(parsed.output)) {
+            return parsed.output.map((p) => typeof p === "string" ? p : (p?.text || p?.content || "")).join("");
+          }
+        }
+      } catch {}
+    }
+    return o;
+  }
   if (typeof o === "number" || typeof o === "boolean") return String(o);
   if (Array.isArray(o)) {
     // Codex 的 custom_tool_call_output.output 是 input_text 数组，剔除 "Script completed"/"Wall time" 等元信息
     const parts = o.map(p => typeof p === "string" ? p : (p?.text || p?.content || JSON.stringify(p)));
-    return parts.filter(p => !/^(Script completed|Wall time)/.test(p.trim())).join("");
+    const joined = parts.filter(p => !/^(Script completed|Wall time)/.test(p.trim())).join("");
+    const trimmed = joined.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object") {
+          if (typeof parsed.output === "string") return parsed.output;
+          if (Array.isArray(parsed.output)) {
+            return parsed.output.map((p) => typeof p === "string" ? p : (p?.text || p?.content || "")).join("");
+          }
+        }
+      } catch {}
+    }
+    return joined;
   }
   if (typeof o === "object" && o !== null) {
     if (typeof o.stdout === "string" && typeof o.stderr === "string") {
@@ -1623,11 +1663,13 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
 }
 
 // chat completions 与 responses 共用的上游执行：多号重试 + session/run 生命周期 + 流式/非流式出口
-async function executeChat(env, chatParams, mc, isStream, mode) {
+async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
   if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode);
   const debug = env.FREEBUFF_DEBUG === "true";
   const pool = parseAccounts(env);
   if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
+  const requestParams = opts.requestParams || {}; // Responses 原请求参数（用于回显）
+  const preserveToolNames = !!opts.preserveToolNames; // Anthropic 路径：保留客户端声明的工具名
 
   // 请求内多号重试：一个号失败（超时/429/428 重建无效/run 失败）立即冷却并换下一个号，最多试完整个账号池。
   // 免费通道上游波动大（并发>1 即出问题、排队超时），单请求内换号比等客户端重试成功率高得多。
@@ -1717,15 +1759,15 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
 
       if (isStream) {
         const { readable, writable } = new TransformStream();
-        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, null, chatParams?._clientTools || [], isDsmlPassthrough(chatParams));
+        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, null, chatParams?._clientTools || [], isDsmlPassthrough(chatParams), requestParams);
         else {
           const sanitize = chatShouldSanitize(chatParams);
-          pipeUpstreamToClient(resp.body, writable, null, { sanitize, clientTools: chatParams?._clientTools || chatParams?.tools || [] });
+          pipeUpstreamToClient(resp.body, writable, null, { sanitize, clientTools: chatParams?._clientTools || chatParams?.tools || [], preserveToolNames });
         }
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
 
-      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc, chatParams?._clientTools || [], isDsmlPassthrough(chatParams)), 200);
+      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc, chatParams?._clientTools || [], isDsmlPassthrough(chatParams), requestParams), 200);
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
       // 非流式 chat 同样过滤 DSML/XML：清理 content，并统一净化/合并原生+XML 工具调用
@@ -1734,7 +1776,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         const clientTools = chatParams?._clientTools || chatParams?.tools || [];
         const raw = msg.content || "";
         if (raw) {
-          const parsed = parseXmlToolCallsAndCommentary(raw, clientTools);
+          const parsed = parseXmlToolCallsAndCommentary(raw, clientTools, preserveToolNames);
           msg.content = parsed.cleanedText || "";
         }
         const cleaned = [];
@@ -1744,9 +1786,9 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
           let s;
           try {
             const rawObj = typeof fn.arguments === "string" && fn.arguments.startsWith("{") ? JSON.parse(fn.arguments) : fn.arguments;
-            s = sanitizeToolPayload(fn.name, rawObj, clientTools);
+            s = sanitizeToolPayload(fn.name, rawObj, clientTools, preserveToolNames);
           } catch {
-            s = sanitizeToolPayload(fn.name, { command: fn.arguments }, clientTools);
+            s = sanitizeToolPayload(fn.name, { command: fn.arguments }, clientTools, preserveToolNames);
           }
           if (s.drop) continue; // 客户端未声明的工具调用 → 丢弃
           const key = s.fnName + "::" + s.args;
@@ -1964,7 +2006,8 @@ async function handleAnthropicMessages(request, env) {
   const mc = await resolveModelConfig(openaiModel);
   if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
   const chat = anthropicToChat(body, mc);
-  const response = await executeChat(env, chat, mc, !!chat.stream, "chat");
+  // Anthropic/Claude Code 路径：保留客户端声明的工具名（Bash/Read/Write…），不做 Codex exec 协议改写
+  const response = await executeChat(env, chat, mc, !!chat.stream, "chat", { preserveToolNames: true });
   if (response.status >= 400) {
     let msg = "Upstream error"; try { const data = await response.json(); msg = data?.error?.message || msg; } catch {}
     const types = { 400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 429: "rate_limit_error", 503: "overloaded_error" };
@@ -2006,12 +2049,13 @@ function isDsmlPassthrough(chatParams) {
 function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) {
   const sanitize = !!options.sanitize;
   const clientTools = Array.isArray(options.clientTools) ? options.clientTools : [];
+  const preserveToolNames = !!options.preserveToolNames; // Anthropic/Claude Code 路径：不改写工具名
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const chunkId = "chatcmpl_" + Math.random().toString(36).slice(2, 12);
-  let buf = "", model = "", usage = null, finishReason = null;
+  let buf = "", model = "", usage = null, finishReason = null, sawUpstreamDone = false, upstreamError = null;
 
   const sendObj = (obj) => writer.write(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
   const emitChunk = (delta, extra = {}) => sendObj({
@@ -2049,17 +2093,17 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
     for (const it of nativeToolItems.values()) {
       try {
         const rawObj = typeof it.args === "string" ? (it.args.startsWith("{") ? JSON.parse(it.args) : it.args) : (it.args || {});
-        const s = sanitizeToolPayload(it.name, rawObj, clientTools);
+        const s = sanitizeToolPayload(it.name, rawObj, clientTools, preserveToolNames);
         if (s.drop) continue; // 客户端未声明的工具调用 → 丢弃
         calls.push({ id: it.id, type: "function", function: { name: s.fnName, arguments: typeof s.args === "string" ? s.args : JSON.stringify(s.args) } });
       } catch {
-        const s = sanitizeToolPayload(it.name, { command: it.args }, clientTools);
+        const s = sanitizeToolPayload(it.name, { command: it.args }, clientTools, preserveToolNames);
         if (s.drop) continue;
         calls.push({ id: it.id, type: "function", function: { name: s.fnName, arguments: typeof s.args === "string" ? s.args : JSON.stringify(s.args) } });
       }
     }
     if (rawTextAccumulator) {
-      const parsed = parseXmlToolCallsAndCommentary(rawTextAccumulator, clientTools);
+      const parsed = parseXmlToolCallsAndCommentary(rawTextAccumulator, clientTools, preserveToolNames);
       for (const tc of parsed.toolCalls) {
         calls.push({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.arguments } });
       }
@@ -2081,6 +2125,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
   (async () => {
     try {
       while (true) {
+        if (upstreamError) break;
         const { done, value } = await reader.read();
         if (done) break;
         buf += decoder.decode(value, { stream: true });
@@ -2089,9 +2134,21 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
           const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
           if (line.startsWith("data:")) {
             const payload = line.slice(5).trim();
-            if (payload === "" || payload === "[DONE]") { await writer.write(encoder.encode(line + "\n\n")); continue; }
+            if (payload === "") { await writer.write(encoder.encode(line + "\n\n")); continue; }
+            if (payload === "[DONE]") {
+              // [DONE] 必须最后发送：先缓冲上游终止符，等合成的 tool_calls/finish_reason/usage
+              // 块全部发完再发，否则 OpenAI SDK 在第一个 [DONE] 就停止解析、工具调用静默丢失。
+              sawUpstreamDone = true;
+              if (!sanitize) await writer.write(encoder.encode(line + "\n\n"));
+              continue;
+            }
             try {
               const normalized = unwrapData(JSON.parse(payload));
+              if (normalized && normalized.error && !normalized.choices) {
+                // 上游流中途返回错误（额度耗尽/模型不可用等）：不再合成假完成
+                upstreamError = normalized.error;
+                break;
+              }
               if (!sanitize) {
                 await writer.write(encoder.encode("data: " + JSON.stringify(normalized) + "\n\n"));
                 continue;
@@ -2115,17 +2172,23 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
       }
 
       if (sanitize) {
-        const flushed = xmlFilter.flush();
-        if (flushed) await emitChunk({ content: flushed });
-        const parsed = parseXmlToolCallsAndCommentary(rawTextAccumulator, clientTools);
-        const hasCalls = nativeToolItems.size > 0 || parsed.toolCalls.length > 0;
-        let fr = finishReason || "stop";
-        if (hasCalls && await finalizeToolCalls()) fr = "tool_calls";
-        const finalChunk = { id: chunkId, object: "chat.completion.chunk", model, choices: [{ index: 0, delta: {}, finish_reason: fr }] };
-        if (usage) finalChunk.usage = usage;
-        await sendObj(finalChunk);
+        if (upstreamError) {
+          await writer.write(encoder.encode("data: " + JSON.stringify({ error: upstreamError }) + "\n\n"));
+        } else {
+          const flushed = xmlFilter.flush();
+          if (flushed) await emitChunk({ content: flushed });
+          const parsed = parseXmlToolCallsAndCommentary(rawTextAccumulator, clientTools);
+          const hasCalls = nativeToolItems.size > 0 || parsed.toolCalls.length > 0;
+          let fr = finishReason || "stop";
+          if (hasCalls && await finalizeToolCalls()) fr = "tool_calls";
+          const finalChunk = { id: chunkId, object: "chat.completion.chunk", model, choices: [{ index: 0, delta: {}, finish_reason: fr }] };
+          if (usage) finalChunk.usage = usage;
+          await sendObj(finalChunk);
+        }
+        await writer.write(encoder.encode("data: [DONE]\n\n"));
+      } else if (!sawUpstreamDone) {
+        await writer.write(encoder.encode("data: [DONE]\n\n"));
       }
-      await writer.write(encoder.encode("data: [DONE]\n\n"));
     } catch (err) {
       // R1：绝不让客户端无声挂起——至少告知错误再关闭
       try {
@@ -2160,6 +2223,13 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
       if (payload === "" || payload === "[DONE]") continue;
       try {
         const obj = unwrapData(JSON.parse(payload));
+        if (obj && obj.error && !obj.choices) {
+          throw new Error("Upstream error: " + String(obj.error?.message || JSON.stringify(obj.error)).slice(0, 500));
+        }
+        // usage/model 可能在独立的尾块里到达（choices 为空）：先于 choice 判断收集
+        if (obj.id) id = obj.id;
+        if (obj.model) model = obj.model;
+        if (obj.usage) usage = obj.usage;
         const choice = obj?.choices?.[0];
         if (!choice) continue;
         const delta = choice.delta || {};
@@ -2185,10 +2255,9 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
           }
         }
         if (choice.finish_reason) finishReason = choice.finish_reason;
-        if (obj.id) id = obj.id;
-        if (obj.model) model = obj.model;
-        if (obj.usage) usage = obj.usage;
-      } catch {}
+      } catch (e) {
+        if (e instanceof Error && e.message.startsWith("Upstream error")) throw e;
+      }
     }
   }
   const msg = { role: "assistant", content };
@@ -2241,10 +2310,16 @@ function execApiFromClient(clientTools) {
 // 从 Codex custom_tool_call 的 JS input 中稳健提取要执行的命令字符串。
 // 兼容新旧两种 exec 写法（exec_command({cmd}) / shell_command({command})）及裸 JSON。
 function extractExecCommandText(input) {
+  if (input === undefined || input === null) return "";
+  if (typeof input === "object") {
+    if (typeof input.cmd === "string" && input.cmd) return input.cmd;
+    if (typeof input.command === "string" && input.command) return input.command;
+    return "";
+  }
   if (typeof input !== "string" || input.length === 0) return "";
   for (const re of [
-    /cmd\s*:\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/,
-    /command\s*:\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/,
+    /["']?cmd["']?\s*:\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/,
+    /["']?command["']?\s*:\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/,
   ]) {
     const m = re.exec(input);
     if (m) {
@@ -2271,7 +2346,7 @@ const CODEX_NATIVE_TOOLS = new Set([
   "view_image", "write_stdin",
 ]);
 
-function sanitizeToolPayload(rawFnName, args, clientTools = []) {
+function sanitizeToolPayload(rawFnName, args, clientTools = [], preserveNames = false) {
   let hasExecCommand = false;
   let hasExec = false;
   let hasShellCommand = false;
@@ -2289,6 +2364,19 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
   const isExecLike = n === "exec_command" || n === "exec" || n === "bash" ||
     n === "run_command" || n === "shell" || n === "terminal" || n === "cmd" ||
     n === "functions.exec" || n === "shell_command";
+
+  if (preserveNames) {
+    // Anthropic/Claude Code 路径：保留客户端声明的原始工具名与参数形状（Bash/Read/Write…），
+    // 不做 Codex exec 协议改写；仅做未声明丢弃 + XML 残留清理。
+    const declared = Array.isArray(clientTools) && clientTools.some((t) => {
+      const dn = (t?.name || t?.function?.name || "").toLowerCase();
+      return dn === n || dn === rawFnName.toLowerCase();
+    });
+    if (!declared && !n.startsWith("mcp__") && !CODEX_NATIVE_TOOLS.has(n)) return { fnName, drop: true };
+    if (typeof args === "string") return { fnName, args: stripResidualXml(args) };
+    if (args && typeof args === "object") return { fnName, args };
+    return { fnName, args: "" };
+  }
 
   if (isExecLike) {
     if (hasShellCommand && !hasExec) {
@@ -2578,7 +2666,7 @@ function normalizeTagPrefixes(rawText) {
     (m, slash, tag) => `<${slash}${tag}`);
 }
 
-function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
+function parseXmlToolCallsAndCommentary(rawText, clientTools = [], preserveToolNames = false) {
   if (!rawText || typeof rawText !== "string") return { cleanedText: rawText || "", commentary: "", toolCalls: [] };
   
   let cleanedText = normalizeTagPrefixes(rawText);
@@ -2593,18 +2681,11 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
   const toolCalls = [];
   const commentaryParts = [];
 
-  const commentaryRegex = /<textarea\s+placeholder=["']commentary["']>([\s\S]*?)<\/textarea>|<commentary>([\s\S]*?)<\/commentary>|<thought>([\s\S]*?)<\/thought>|<thinking>([\s\S]*?)<\/thinking>|<function_calls[^>]*>([\s\S]*?)<\/function_calls>|<tool_response[^>]*>([\s\S]*?)<\/tool_response>/gi;
-  cleanedText = cleanedText.replace(commentaryRegex, (match, p1, p2, p3, p4, p5, p6) => {
-    const text = (p1 || p2 || p3 || p4 || p5 || p6 || "").trim();
-    if (text) commentaryParts.push(text);
-    return "";
-  });
-
+  // 先提取 <invoke>/<tool_call>（含嵌在 <function_calls>/<tool_response> 容器内的）并从文本移除，
+  // 再剥离容器——否则容器正则会把里面的工具调用一起吞掉。
   const invokeRegex = /<(?:[a-zA-Z0-9_]+:)?(?:invoke|tool_call)\s+name=["']([^"']+)["']>([\s\S]*?)<\/(?:[a-zA-Z0-9_]+:)?(?:invoke|tool_call)>/gi;
-  let match;
-  while ((match = invokeRegex.exec(cleanedText)) !== null) {
-    const fnName = match[1].replace(/^[a-zA-Z0-9_]+:/, "").trim();
-    const body = match[2];
+  const parseInvoke = (fnName, body) => {
+    const cleanName = fnName.replace(/^[a-zA-Z0-9_]+:/, "").trim();
     let args = {};
     const paramRegex = /<(?:[a-zA-Z0-9_]+:)?parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)(?:<\/(?:[a-zA-Z0-9_]+:)?parameter>|(?=<(?:[a-zA-Z0-9_]+:)?parameter|<\/(?:[a-zA-Z0-9_]+:)?(?:invoke|tool_call)|$))/gi;
     let pMatch;
@@ -2625,17 +2706,27 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
         if (body.trim()) args["command"] = stripResidualXml(body);
       }
     }
-    
-    const sanitized = sanitizeToolPayload(fnName, args, clientTools);
-    if (sanitized.drop) continue; // 客户端未声明的工具调用 → 丢弃
-    toolCalls.push({
+    const sanitized = sanitizeToolPayload(cleanName, args, clientTools, preserveToolNames);
+    if (sanitized.drop) return null; // 客户端未声明的工具调用 → 丢弃
+    return {
       id: "call_" + Math.random().toString(36).slice(2, 10),
       name: sanitized.fnName,
-      arguments: typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args)
-    });
-  }
+      arguments: typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args),
+    };
+  };
+  cleanedText = cleanedText.replace(invokeRegex, (match, fnName, body) => {
+    const call = parseInvoke(fnName, body);
+    if (call) toolCalls.push(call);
+    return "";
+  });
 
-  // Also support direct tool tags like <exec_command><cmd>...</cmd></exec_command> or <exec><command>...</command></exec>
+  const commentaryRegex = /<textarea\s+placeholder=["']commentary["']>([\s\S]*?)<\/textarea>|<commentary>([\s\S]*?)<\/commentary>|<thought>([\s\S]*?)<\/thought>|<thinking>([\s\S]*?)<\/thinking>|<function_calls[^>]*>([\s\S]*?)<\/function_calls>|<tool_response[^>]*>([\s\S]*?)<\/tool_response>/gi;
+  cleanedText = cleanedText.replace(commentaryRegex, (match, p1, p2, p3, p4, p5, p6) => {
+    const text = (p1 || p2 || p3 || p4 || p5 || p6 || "").trim();
+    if (text) commentaryParts.push(text);
+    return "";
+  });
+
   const directToolRegex = /<(?:[a-zA-Z0-9_]+:)?(exec_command|exec|bash|shell_command|run_command|apply_patch|read_file|write_file)>([\s\S]*?)<\/(?:[a-zA-Z0-9_]+:)?\1>/gi;
   let dMatch;
   while ((dMatch = directToolRegex.exec(cleanedText)) !== null) {
@@ -2662,7 +2753,7 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
       }
     }
 
-    const sanitized = sanitizeToolPayload(fnName, args, clientTools);
+    const sanitized = sanitizeToolPayload(fnName, args, clientTools, preserveToolNames);
     if (sanitized.drop) continue; // 客户端未声明的工具调用 → 丢弃
     toolCalls.push({
       id: "call_" + Math.random().toString(36).slice(2, 10),
@@ -2676,7 +2767,7 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
   return { cleanedText, commentary: commentaryParts.join("\n\n"), toolCalls };
 }
 
-function responsesBase(mc, respId, createdAt) {
+function responsesBase(mc, respId, createdAt, requestParams = {}) {
   return {
     id: respId || "resp_" + Math.random().toString(36).slice(2, 10),
     object: "response",
@@ -2684,23 +2775,23 @@ function responsesBase(mc, respId, createdAt) {
     status: "in_progress",
     error: null,
     incomplete_details: null,
-    instructions: null,
-    max_output_tokens: null,
+    instructions: requestParams.instructions ?? null,
+    max_output_tokens: requestParams.max_output_tokens ?? null,
     model: mc.id,
     output: [],
-    parallel_tool_calls: true,
-    previous_response_id: null,
-    reasoning: { effort: null, summary: null },
-    store: true,
-    temperature: 1.0,
-    text: { format: { type: "text" } },
-    tool_choice: "auto",
-    tools: [],
-    top_p: 1.0,
-    truncation: "disabled",
+    parallel_tool_calls: requestParams.parallel_tool_calls ?? true,
+    previous_response_id: requestParams.previous_response_id ?? null,
+    reasoning: { effort: requestParams.reasoning?.effort ?? null, summary: null },
+    store: requestParams.store ?? true,
+    temperature: requestParams.temperature ?? 1.0,
+    text: requestParams.text ?? { format: { type: "text" } },
+    tool_choice: requestParams.tool_choice ?? "auto",
+    tools: requestParams.tools ?? [],
+    top_p: requestParams.top_p ?? 1.0,
+    truncation: requestParams.truncation ?? "disabled",
     usage: null,
-    user: null,
-    metadata: {},
+    user: requestParams.user ?? null,
+    metadata: requestParams.metadata ?? {},
   };
 }
 
@@ -2733,7 +2824,7 @@ function chatUsageToResponsesUsage(usage) {
 }
 
 // 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
-async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete, clientTools = [], dsmlPassthrough = false) {
+async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete, clientTools = [], dsmlPassthrough = false, requestParams = {}) {
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
   const decoder = new TextDecoder();
@@ -2751,8 +2842,8 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
 
   (async () => {
     try {
-      await send({ type: "response.created", response: responsesBase(mc, respId, createdAt) });
-      await send({ type: "response.in_progress", response: responsesBase(mc, respId, createdAt) });
+      await send({ type: "response.created", response: responsesBase(mc, respId, createdAt, requestParams) });
+      await send({ type: "response.in_progress", response: responsesBase(mc, respId, createdAt, requestParams) });
 
       while (true) {
         const { done, value } = await reader.read();
@@ -2766,6 +2857,10 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
           if (payload === "" || payload === "[DONE]") continue;
           try {
             const obj = unwrapData(JSON.parse(payload));
+            if (obj && obj.error && !obj.choices) {
+              // 上游流中途返回错误（额度耗尽/模型不可用等）：不再合成假 completed
+              throw new Error("Upstream error: " + String(obj.error?.message || JSON.stringify(obj.error)).slice(0, 500));
+            }
             const choice = obj?.choices?.[0];
             if (!choice) continue;
             const delta = choice.delta || {};
@@ -2777,39 +2872,50 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
               for (const tc of delta.tool_calls) {
                 if (!tc || typeof tc !== "object") continue;
                 const ti = tc.index ?? 0;
+                const fn = tc.function || {};
+                const rawName = fn.name || "";
                 let item = nativeToolItems.get(ti);
                 if (!item) {
-                  const rawName = tc.function?.name || "";
-                  // 名称与类型即时确定（参数值不影响名称映射），保证 added 事件的 type/name 与最终一致
-                  const nameInfo = sanitizeToolPayload(rawName, {}, clientTools);
-                  if (nameInfo.drop) {
-                    // 客户端未声明的工具 → 不产生 added 事件、不累积参数
-                    nativeToolItems.set(ti, { dropped: true, outputIndex: -1 });
-                    continue;
-                  }
-                  const isCustom = nameInfo.fnName === "exec";
-                  item = {
-                    kind: "function_call",
-                    id: "fc_" + Math.random().toString(36).slice(2, 10),
-                    callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
-                    name: nameInfo.fnName,
-                    args: "",
-                    outputIndex: nextOutputIndex++,
-                    started: false,
-                  };
+                  // 名称可能晚于首个 delta 到达：先挂起累积参数，名称确定后再决定 added/drop，
+                  // 避免首 delta 无名就把真实工具调用误判为未声明而丢弃。
+                  item = { pending: true, name: "", args: "", dropped: false };
                   nativeToolItems.set(ti, item);
-                  const addedItem = isCustom
-                    ? { id: item.id, type: "custom_tool_call", status: "in_progress", call_id: item.callId, name: item.name, input: "" }
-                    : { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" };
-                  await send({ type: "response.output_item.added", output_index: item.outputIndex, item: addedItem });
-                  item.started = true;
                 }
-                const fn = tc.function || {};
+                if (fn.name && !item.name) {
+                  item.name = fn.name;
+                  if (item.pending) {
+                    item.pending = false;
+                    const nameInfo = sanitizeToolPayload(item.name, {}, clientTools);
+                    if (nameInfo.drop) {
+                      // 客户端未声明的工具 → 不产生 added 事件、不累积参数
+                      item.dropped = true;
+                      item.outputIndex = -1;
+                    } else {
+                      const isCustom = nameInfo.fnName === "exec";
+                      item.kind = "function_call";
+                      item.id = "fc_" + Math.random().toString(36).slice(2, 10);
+                      item.callId = tc.id || "call_" + Math.random().toString(36).slice(2, 10);
+                      item.name = nameInfo.fnName;
+                      item.outputIndex = nextOutputIndex++;
+                      item.started = false;
+                      const addedItem = isCustom
+                        ? { id: item.id, type: "custom_tool_call", status: "in_progress", call_id: item.callId, name: item.name, input: "" }
+                        : { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" };
+                      await send({ type: "response.output_item.added", output_index: item.outputIndex, item: addedItem });
+                      item.started = true;
+                    }
+                  }
+                }
                 if (fn.arguments) {
                   if (item?.dropped) continue;
                   item.args += fn.arguments;
                 }
               }
+            }
+
+            // 推理增量：透传 reasoning_summary，Codex GUI 不再空白等待
+            if (delta.reasoning_content) {
+              await send({ type: "response.reasoning_summary.delta", item_id: contentItem?.id || "", output_index: contentItem?.outputIndex ?? 0, delta: delta.reasoning_content });
             }
 
             // 文本增量：实时过滤 DSML / commentary / tool_calls / attempt_completion 标签，绝不把 XML 泄露给客户端
@@ -2858,9 +2964,8 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         // (Codex rejects responses where output_text is completely empty)
         if (!contentItem.text.trim()) {
           contentItem.text = cleanMessageText.trim() || rawTextAccumulator.replace(/<[^>]*>/g, "").trim() || " ";
-        } else {
-          contentItem.text = cleanMessageText || contentItem.text;
         }
+        // 已流式上屏的累积文本优先：保证 output_text.done 与流式 delta 之和一致
         finalItems.push(contentItem);
       } else if (cleanMessageText.trim().length > 0 || !hasToolCalls) {
         // Fallback priority: clean text → commentary → raw stripped text → single space
@@ -2881,6 +2986,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
 
       for (const item of nativeToolItems.values()) {
         if (item?.dropped) continue; // 已丢弃的未知工具
+        if (item?.pending) continue; // 名称始终未到达的悬挂项：从未上屏，静默丢弃（不会孤儿化）
         finalItems.push(item);
       }
 
@@ -2914,6 +3020,8 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       finalItems.sort((a, b) => a.outputIndex - b.outputIndex);
 
       // B5：先净化全部工具项，再按 (name, args) 去重，防止上游同时给 native+XML 两份导致命令重复执行
+      // 去重只移除从未 live-added 的项（started===false）：已上屏的项移除会让 Codex 永久等一个
+      // 永远不会来的 .done 事件（孤儿项挂死），宁可保留重复调用。
       const seenTools = new Set();
       const toolFinalize = async (item) => {
         if (item.kind !== "function_call") return true;
@@ -2921,18 +3029,18 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         try {
           const rawObj = typeof item.args === "string" ? (item.args.startsWith("{") ? JSON.parse(item.args) : item.args) : (item.args || {});
           const sanitized = sanitizeToolPayload(item.name, rawObj, clientTools);
-          if (sanitized.drop) return false; // 客户端未声明的工具调用 → 丢弃
+          if (sanitized.drop) return item.started; // 已上屏的项无法回收 → 保留（避免孤儿）；未上屏 → 丢弃
           item.name = sanitized.fnName;
           cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
         } catch {
           const sanitized = sanitizeToolPayload(item.name, { command: item.args }, clientTools);
-          if (sanitized.drop) return false;
+          if (sanitized.drop) return item.started;
           item.name = sanitized.fnName;
           cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
         }
         item.args = cleanArgs;
         const key = item.name + "::" + item.args;
-        if (seenTools.has(key)) return false;
+        if (seenTools.has(key)) return item.started; // 重复项：只有已上屏的保留，未上屏的移除
         seenTools.add(key);
         return true;
       };
@@ -2976,7 +3084,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         }
       }
 
-      const resp = responsesBase(mc, respId, createdAt);
+      const resp = responsesBase(mc, respId, createdAt, requestParams);
       resp.status = "completed";
       resp.model = model || mc.id;
       resp.output = keptItems.map((item) => {
@@ -2994,7 +3102,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       console.error("[pipeUpstreamToResponsesStream error]", err);
       // R1：流中途出错时告知客户端，绝不无声挂起
       try {
-        const failed = responsesBase(mc, respId, createdAt);
+        const failed = responsesBase(mc, respId, createdAt, requestParams);
         failed.status = "failed";
         failed.error = { code: "upstream_stream_error", message: String(err?.message || err) };
         await send({ type: "response.failed", response: failed });
@@ -3009,7 +3117,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
 }
 
 // 非流式：聚合上游流成 Responses API 非流式对象
-async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPassthrough = false) {
+async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPassthrough = false, requestParams = {}) {
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   let buf = "", model = "", outputText = "", reasoning = "", usage = null;
@@ -3026,6 +3134,11 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
       if (payload === "" || payload === "[DONE]") continue;
       try {
         const obj = unwrapData(JSON.parse(payload));
+        if (obj && obj.error && !obj.choices) {
+          throw new Error("Upstream error: " + String(obj.error?.message || JSON.stringify(obj.error)).slice(0, 500));
+        }
+        if (obj.model) model = obj.model;
+        if (obj.usage) usage = obj.usage;
         const choice = obj?.choices?.[0];
         if (!choice) continue;
         const delta = choice.delta || {};
@@ -3051,12 +3164,12 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
             if (fn.arguments) item.args += fn.arguments;
           }
         }
-        if (obj.model) model = obj.model;
-        if (obj.usage) usage = obj.usage;
-      } catch {}
+      } catch (e) {
+        if (e instanceof Error && e.message.startsWith("Upstream error")) throw e;
+      }
     }
   }
-  const resp = responsesBase(mc, undefined, Math.floor(Date.now() / 1000));
+  const resp = responsesBase(mc, undefined, Math.floor(Date.now() / 1000), requestParams);
   resp.status = "completed";
   resp.model = model || mc.id;
   resp.output = [];
@@ -3072,20 +3185,19 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
       resp.output.push({ id, type: "function_call", status: "completed", call_id: callId, name, arguments: args });
     }
   };
-  if (outputText || reasoning) {
-    const raw = outputText || reasoning;
-    const parsed = dsmlPassthrough ? { cleanedText: raw, toolCalls: [], commentary: "" } : parseXmlToolCallsAndCommentary(raw, clientTools);
-    const text = dsmlPassthrough ? parsed.cleanedText : (parsed.cleanedText || parsed.commentary);
-    if (text) {
-      resp.output.push({
-        id: "msg_" + Math.random().toString(36).slice(2, 10),
-        type: "message", status: "completed", role: "assistant",
-        content: [{ type: "output_text", text, annotations: [] }],
-      });
-    }
-    for (const tc of parsed.toolCalls) {
-      pushToolItem("fc_" + Math.random().toString(36).slice(2, 10), tc.id, tc.name, tc.arguments);
-    }
+  // 总是解析（即使无可见文本，XML 工具调用也必须提取）
+  const raw = outputText || reasoning || "";
+  const parsed = dsmlPassthrough ? { cleanedText: raw, toolCalls: [], commentary: "" } : parseXmlToolCallsAndCommentary(raw, clientTools);
+  const text = dsmlPassthrough ? parsed.cleanedText : (parsed.cleanedText || parsed.commentary);
+  if (text) {
+    resp.output.push({
+      id: "msg_" + Math.random().toString(36).slice(2, 10),
+      type: "message", status: "completed", role: "assistant",
+      content: [{ type: "output_text", text, annotations: [] }],
+    });
+  }
+  for (const tc of parsed.toolCalls) {
+    pushToolItem("fc_" + Math.random().toString(36).slice(2, 10), tc.id, tc.name, tc.arguments);
   }
   for (const item of toolItems.values()) {
     // 原生工具调用同样净化（exec_command/裸 JSON → 客户端协议）
@@ -3104,6 +3216,14 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
       cleanArgs = typeof s.args === "string" ? s.args : JSON.stringify(s.args);
     }
     pushToolItem(item.id, item.callId, cleanName, cleanArgs);
+  }
+  // Codex 拒绝 output 为空的响应：兜底一个空格文本项
+  if (resp.output.length === 0) {
+    resp.output.push({
+      id: "msg_" + Math.random().toString(36).slice(2, 10),
+      type: "message", status: "completed", role: "assistant",
+      content: [{ type: "output_text", text: " ", annotations: [] }],
+    });
   }
   resp.usage = chatUsageToResponsesUsage(usage);
   return resp;
@@ -3151,12 +3271,13 @@ async function handleModels() {
 }
 
 function getApiKey(request, env) {
-  const expected = (env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY).trim();
+  // 未配置 API key → 拒绝所有请求（不允许默认密钥后门）；配置后要求精确匹配
+  const configured = (env.API_KEY || env.FREEBUFF_API_KEY || "").trim();
   const auth = request.headers.get("Authorization") || "";
   const xKey = request.headers.get("x-api-key") || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : xKey.trim();
-  if (!token) return null;
-  if (expected === DEFAULT_API_KEY || expected === "" || token === expected) return token;
+  if (!token || !configured) return null;
+  if (token === configured) return token;
   return null;
 }
 
