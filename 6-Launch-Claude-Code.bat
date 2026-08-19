@@ -4,13 +4,21 @@ cd /d "%~dp0"
 echo ====================================================
 echo             Claude Code - Powered by Freebuff
 echo ====================================================
-echo Endpoint: http://localhost:8787
+echo Endpoint: https://freebuff2api-walid-bezouis-projects-fc73dfba.vercel.app
 echo API Key : freebuff-default-key
+echo Model   : deepseek/deepseek-v4-flash (effort max)
 echo ====================================================
 echo.
 
-set ANTHROPIC_BASE_URL=http://localhost:8787
+set ANTHROPIC_BASE_URL=https://freebuff2api-walid-bezouis-projects-fc73dfba.vercel.app
 set ANTHROPIC_API_KEY=freebuff-default-key
+set ANTHROPIC_MODEL=deepseek/deepseek-v4-flash
+set CLAUDE_CODE_EFFORT_LEVEL=max
+set MAX_THINKING_TOKENS=32000
+set CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=true
+set CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+set ANTHROPIC_CUSTOM_MODEL_OPTION=deepseek/deepseek-v4-flash
+set ANTHROPIC_CUSTOM_MODEL_OPTION_NAME=DeepSeek V4 Flash (max)
 
 if exist "%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe" (
   "%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe" %*

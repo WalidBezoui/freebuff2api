@@ -824,6 +824,34 @@ async function readRawSSE(res) {
   check("T34 non-stream upstream error -> 502", res.status === 502 && String(json?.error?.message).includes("boom"), res.status + " " + JSON.stringify(json).slice(0, 200));
 }
 
+// ---------- T35: Anthropic thinking 顶部预算（MAX_THINKING_TOKENS=32000）→ effort max ----------
+{
+  currentStream = [{ id: "cmpl-35", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer freebuff-default-key", "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model: MODEL, stream: true, max_tokens: 100, thinking: { type: "enabled", budget_tokens: 32000 }, messages: [{ role: "user", content: "hi" }] }),
+  });
+  const res = await worker.fetch(req, ENV);
+  await readRawSSE(res);
+  check("T35 budget 32000 -> reasoning_effort max", upstreamChatBodies[0]?.body?.reasoning_effort === "max", JSON.stringify(upstreamChatBodies[0]?.body?.reasoning_effort));
+}
+
+// ---------- T36: Anthropic 显式 effort 字段原样透传 ----------
+{
+  currentStream = [{ id: "cmpl-36", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer freebuff-default-key", "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model: MODEL, stream: true, max_tokens: 100, effort: "max", messages: [{ role: "user", content: "hi" }] }),
+  });
+  const res = await worker.fetch(req, ENV);
+  await readRawSSE(res);
+  check("T36 explicit effort max passthrough", upstreamChatBodies[0]?.body?.reasoning_effort === "max", JSON.stringify(upstreamChatBodies[0]?.body?.reasoning_effort));
+}
+
 const failed = results.filter((r) => !r.ok);
 console.log("\n=== " + (results.length - failed.length) + "/" + results.length + " passed ===");
 process.exit(failed.length ? 1 : 0);

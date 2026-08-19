@@ -34,9 +34,9 @@
 - 非流式响应和 Anthropic SSE 流式响应
 - Anthropic 风格的错误响应
 
-> ⚠️ **测试说明**：当前项目维护者没有实际使用 Anthropic Messages API 的客户端环境，因此暂未完成真实 Anthropic 客户端的端到端测试。主代码和本地 stub / 回归测试已经处理并验证转换逻辑，但不代表所有 Anthropic SDK、工具调用组合和客户端行为都已覆盖。
+> 💡 **Claude Code 客户端配置**（2026-08-19 实测接入）：设置 `ANTHROPIC_BASE_URL`（部署地址）、`ANTHROPIC_API_KEY`（与 `FREEBUFF_API_KEY` 一致）、`ANTHROPIC_MODEL=deepseek/deepseek-v4-flash`；`CLAUDE_CODE_EFFORT_LEVEL=max` + `MAX_THINKING_TOKENS=32000` 让 flash 跑官方允许的最高推理档位（`thinking.budget_tokens ≥ 24000 → reasoning_effort=max`）；`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` 让 `/model` 选择器直接列出本网关的全部模型。仓库内 `6-Launch-Claude-Code.bat` 即为完整示例。
 >
-> 如果你有 Anthropic Messages API 的实际使用场景，欢迎在不影响现有 OpenAI API 线路的前提下进行测试，并反馈请求格式、流式响应、工具调用或模型兼容性问题。反馈时请尽量附上脱敏后的请求结构、响应状态码和错误信息。
+> ⚠️ **测试说明**：主代码和本地 stub / 回归测试已经处理并验证转换逻辑（Anthropic 工具名保留、`tool_use` 终止、effort 分档），但不代表所有 Anthropic SDK、工具调用组合和客户端行为都已覆盖。
 >
 > Anthropic API 是新增的协议适配层，不改变现有 OpenAI `/v1/chat/completions`、`/v1/responses`、账号轮换、session 生命周期和 Freebuff 主调用链。
 

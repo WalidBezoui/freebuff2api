@@ -1,6 +1,6 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
-const VERSION = "1.9.0";
+const VERSION = "1.9.1";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 动态模型注册表：从官方 freebuff 镜像拉取模型清单
@@ -1875,10 +1875,16 @@ function anthropicToChat(body, mc) {
   if (body.max_tokens != null) chat.max_completion_tokens = body.max_tokens;
   for (const k of ["temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty"]) if (body[k] != null) chat[k] = body[k];
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) chat.stop = body.stop_sequences;
-  if (body.thinking?.type === "enabled" && Number.isFinite(body.thinking.budget_tokens)) {
+  // 显式档位字段优先（部分客户端/网关直接透传 reasoning_effort 或 effort）
+  const explicitEffort = body.reasoning_effort || body.effort;
+  if (typeof explicitEffort === "string" && explicitEffort) {
+    chat.reasoning_effort = explicitEffort;
+  } else if (body.thinking?.type === "enabled" && Number.isFinite(body.thinking.budget_tokens)) {
     // Anthropic thinking budget → reasoning effort 分档；经 clamp 归一化后即使产生
-    // medium（如 deepseek-v4-flash 不支持）也会被钳到最近可用档
-    chat.reasoning_effort = body.thinking.budget_tokens >= 16000 ? "high" : body.thinking.budget_tokens >= 8000 ? "medium" : "low";
+    // medium（如 deepseek-v4-flash 不支持）也会被钳到最近可用档。
+    // 顶部档（budget ≥ 24000，如 Claude Code 的 MAX_THINKING_TOKENS=32000）→ max，
+    // 让 deepseek-v4-flash 拿到官方允许的最高推理档位。
+    chat.reasoning_effort = body.thinking.budget_tokens >= 24000 ? "max" : body.thinking.budget_tokens >= 16000 ? "high" : body.thinking.budget_tokens >= 8000 ? "medium" : "low";
   }
   if (body.metadata && typeof body.metadata === "object") chat.metadata = body.metadata;
 
