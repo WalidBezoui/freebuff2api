@@ -373,6 +373,77 @@ async function responsesStreamTest(chunks, tools = execTools, input = [{ role: "
   check("T13 completed despite no finish_reason", completed?.response?.status === "completed" && text.includes("plain text"), text.slice(0, 100));
 }
 
+// ---------- T14: apply_patch emitted as RAW patch text for freeform clients (Codex) ----------
+{
+  const patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n";
+  const dsml = `<${P}invoke name="apply_patch"><${P}parameter name="patch">${patch}</${P}parameter></${P}invoke>`;
+  currentStream = [chunk({ role: "assistant", content: "Patching.\n" + dsml }), { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: true,
+      input: [
+        { type: "additional_tools", role: "developer", tools: [{ type: "namespace", name: "functions", tools: [{ type: "custom", name: "exec", description: "exec tool" }] }] },
+        { type: "message", role: "user", content: "patch it" },
+      ],
+    }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const completed = events.find((e) => e.type === "response.completed");
+  const patchCall = (completed?.response?.output || []).find((o) => o.type === "function_call" && o.name === "apply_patch");
+  check("T14 apply_patch raw text (no JSON wrapper)", !!patchCall && patchCall.arguments === patch.trim(), JSON.stringify(patchCall));
+  check("T14 no XML leak", !JSON.stringify(events).includes("<"), "");
+}
+
+// ---------- T15: undecared tool (web_search) dropped for freeform clients ----------
+{
+  const dsml = `<${P}invoke name="web_search"><${P}parameter name="query">nodejs 22</${P}parameter></${P}invoke>`;
+  currentStream = [chunk({ role: "assistant", content: "Searching.\n" + dsml }), { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: true,
+      input: [
+        { type: "additional_tools", role: "developer", tools: [{ type: "namespace", name: "functions", tools: [{ type: "custom", name: "exec", description: "exec tool" }] }] },
+        { type: "message", role: "user", content: "search" },
+      ],
+    }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const completed = events.find((e) => e.type === "response.completed");
+  const out = completed?.response?.output || [];
+  check("T15 web_search dropped for undeclaring client", !out.some((o) => o.type === "function_call" && o.name === "web_search"), JSON.stringify(out));
+  check("T15 still completed with message", completed?.response?.status === "completed" && out.some((o) => o.type === "message"), JSON.stringify(out));
+}
+
+// ---------- T16: bare-body apply_patch (no <parameter> wrapper) keeps patch content ----------
+{
+  const patch = "--- a.txt\n+++ b.txt\n@@ -1 +1 @@\n-old\n+new\n";
+  const dsml = `<${P}invoke name="apply_patch">${patch}</${P}invoke>`;
+  currentStream = [chunk({ role: "assistant", content: dsml }), { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: true,
+      input: [
+        { type: "additional_tools", role: "developer", tools: [{ type: "namespace", name: "functions", tools: [{ type: "custom", name: "exec", description: "exec tool" }] }] },
+        { type: "message", role: "user", content: "patch it" },
+      ],
+    }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const completed = events.find((e) => e.type === "response.completed");
+  const patchCall = (completed?.response?.output || []).find((o) => o.type === "function_call" && o.name === "apply_patch");
+  check("T16 bare-body patch preserved", !!patchCall && patchCall.arguments.includes("--- a.txt"), JSON.stringify(patchCall));
+  check("T16 no empty patch", !!patchCall && patchCall.arguments !== '{"patch":""}', JSON.stringify(patchCall));
+}
+
 const failed = results.filter((r) => !r.ok);
 console.log("\n=== " + (results.length - failed.length) + "/" + results.length + " passed ===");
 process.exit(failed.length ? 1 : 0);

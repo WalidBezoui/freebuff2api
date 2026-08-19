@@ -1748,6 +1748,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
           } catch {
             s = sanitizeToolPayload(fn.name, { command: fn.arguments }, clientTools);
           }
+          if (s.drop) continue; // 客户端未声明的工具调用 → 丢弃
           const key = s.fnName + "::" + s.args;
           if (seen.has(key)) continue;
           seen.add(key);
@@ -2049,9 +2050,11 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
       try {
         const rawObj = typeof it.args === "string" ? (it.args.startsWith("{") ? JSON.parse(it.args) : it.args) : (it.args || {});
         const s = sanitizeToolPayload(it.name, rawObj, clientTools);
+        if (s.drop) continue; // 客户端未声明的工具调用 → 丢弃
         calls.push({ id: it.id, type: "function", function: { name: s.fnName, arguments: typeof s.args === "string" ? s.args : JSON.stringify(s.args) } });
       } catch {
         const s = sanitizeToolPayload(it.name, { command: it.args }, clientTools);
+        if (s.drop) continue;
         calls.push({ id: it.id, type: "function", function: { name: s.fnName, arguments: typeof s.args === "string" ? s.args : JSON.stringify(s.args) } });
       }
     }
@@ -2260,6 +2263,14 @@ function extractExecCommandText(input) {
   return input.trim();
 }
 
+// Codex v0.148 exec 沙箱里真实暴露的工具名（实测 ALL_TOOLS 探针输出）：
+// 除这些之外（exec/apply_patch 另有专门处理），客户端没声明的 function_call 一律丢弃。
+const CODEX_NATIVE_TOOLS = new Set([
+  "create_goal", "get_goal", "list_mcp_resource_templates", "list_mcp_resources",
+  "read_mcp_resource", "shell_command", "exec_command", "update_goal", "update_plan",
+  "view_image", "write_stdin",
+]);
+
 function sanitizeToolPayload(rawFnName, args, clientTools = []) {
   let hasExecCommand = false;
   let hasExec = false;
@@ -2318,6 +2329,18 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
     return { fnName: "exec", args: wrapExec(cmdVal) };
   }
 
+  // 未知工具名兜底：客户端未声明、也不是 Codex 原生工具的调用直接丢弃（drop），
+  // 否则 Codex 会因不认识的 function_call 报错（如 web_search 在 Codex 里不存在）。
+  // 放在所有剩余工具分支之前，确保 web_search 等也经过此检查。
+  if (fnName !== "exec" && fnName !== "apply_patch") {
+    const declared = Array.isArray(clientTools) && clientTools.some((t) => {
+      const dn = (t?.name || t?.function?.name || "").toLowerCase();
+      return dn === fnName.toLowerCase() || dn === rawFnName.toLowerCase();
+    });
+    const codexNative = fnName.startsWith("mcp__") || CODEX_NATIVE_TOOLS.has(fnName);
+    if (!declared && !codexNative) return { fnName, drop: true };
+  }
+
   if (!args || typeof args !== "object") return { fnName, args: cmdVal };
   const clean = {};
   if (fnName === "exec_command") {
@@ -2331,8 +2354,26 @@ function sanitizeToolPayload(rawFnName, args, clientTools = []) {
     return { fnName, args: clean };
   }
   if (fnName === "apply_patch") {
-    clean.patch = stripResidualXml(typeof args.patch === "string" ? args.patch : typeof args.input === "string" ? args.input : "");
-    return { fnName: "apply_patch", args: clean };
+    // 从任意形状稳健提取 patch 文本（XML 解析路径可能给裸字符串/command/body/content）
+    const patch = stripResidualXml(typeof args.patch === "string" ? args.patch
+      : typeof args.input === "string" ? args.input
+      : typeof args === "string" ? args
+      : typeof args.command === "string" ? args.command
+      : typeof args.body === "string" ? args.body
+      : typeof args.content === "string" ? args.content
+      : "");
+    // Codex 的 apply_patch 是 FREEFORM 工具：arguments 必须是裸 patch 文本。
+    // JSON 包装（{"patch":...}）会被当作 patch 内容解析失败 → Codex 报 "The patch tool is aborting"。
+    // 仅当客户端显式声明了 JSON 版 apply_patch 函数工具时才保留 {patch} 对象包装。
+    const jsonDeclared = Array.isArray(clientTools) && clientTools.some((t) => {
+      const dn = (t?.name || t?.function?.name || "").toLowerCase();
+      return (dn === "apply_patch" || dn === "patch" || dn === "edit_file") && (t?.type === "function" || t?.function);
+    });
+    if (jsonDeclared) {
+      clean.patch = patch;
+      return { fnName: "apply_patch", args: clean };
+    }
+    return { fnName: "apply_patch", args: patch };
   }
   if (fnName === "web_search" || fnName === "fetch_web_search") {
     clean.query = stripResidualXml(typeof args.query === "string" ? args.query : typeof args.input === "string" ? args.input : "");
@@ -2586,6 +2627,7 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
     }
     
     const sanitized = sanitizeToolPayload(fnName, args, clientTools);
+    if (sanitized.drop) continue; // 客户端未声明的工具调用 → 丢弃
     toolCalls.push({
       id: "call_" + Math.random().toString(36).slice(2, 10),
       name: sanitized.fnName,
@@ -2621,6 +2663,7 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = []) {
     }
 
     const sanitized = sanitizeToolPayload(fnName, args, clientTools);
+    if (sanitized.drop) continue; // 客户端未声明的工具调用 → 丢弃
     toolCalls.push({
       id: "call_" + Math.random().toString(36).slice(2, 10),
       name: sanitized.fnName,
@@ -2739,6 +2782,11 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
                   const rawName = tc.function?.name || "";
                   // 名称与类型即时确定（参数值不影响名称映射），保证 added 事件的 type/name 与最终一致
                   const nameInfo = sanitizeToolPayload(rawName, {}, clientTools);
+                  if (nameInfo.drop) {
+                    // 客户端未声明的工具 → 不产生 added 事件、不累积参数
+                    nativeToolItems.set(ti, { dropped: true, outputIndex: -1 });
+                    continue;
+                  }
                   const isCustom = nameInfo.fnName === "exec";
                   item = {
                     kind: "function_call",
@@ -2757,7 +2805,10 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
                   item.started = true;
                 }
                 const fn = tc.function || {};
-                if (fn.arguments) item.args += fn.arguments;
+                if (fn.arguments) {
+                  if (item?.dropped) continue;
+                  item.args += fn.arguments;
+                }
               }
             }
 
@@ -2829,6 +2880,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       }
 
       for (const item of nativeToolItems.values()) {
+        if (item?.dropped) continue; // 已丢弃的未知工具
         finalItems.push(item);
       }
 
@@ -2869,10 +2921,12 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         try {
           const rawObj = typeof item.args === "string" ? (item.args.startsWith("{") ? JSON.parse(item.args) : item.args) : (item.args || {});
           const sanitized = sanitizeToolPayload(item.name, rawObj, clientTools);
+          if (sanitized.drop) return false; // 客户端未声明的工具调用 → 丢弃
           item.name = sanitized.fnName;
           cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
         } catch {
           const sanitized = sanitizeToolPayload(item.name, { command: item.args }, clientTools);
+          if (sanitized.drop) return false;
           item.name = sanitized.fnName;
           cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
         }
@@ -3040,10 +3094,12 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
     try {
       const rawObj = typeof item.args === "string" && item.args.startsWith("{") ? JSON.parse(item.args) : item.args;
       const s = sanitizeToolPayload(item.name, rawObj, clientTools);
+      if (s.drop) continue; // 客户端未声明的工具调用 → 丢弃
       cleanName = s.fnName;
       cleanArgs = typeof s.args === "string" ? s.args : JSON.stringify(s.args);
     } catch {
       const s = sanitizeToolPayload(item.name, { command: item.args }, clientTools);
+      if (s.drop) continue;
       cleanName = s.fnName;
       cleanArgs = typeof s.args === "string" ? s.args : JSON.stringify(s.args);
     }
