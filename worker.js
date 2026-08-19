@@ -1293,32 +1293,82 @@ function responsesToChatParams(params, mc) {
     if (params.text.format.json_schema) chat.response_format.json_schema = params.text.format.json_schema;
   }
   // Responses 工具格式（扁平 function/custom）→ chat completions 格式（function 包装）。
+  const mapResponsesTool = (t) => {
+    if (!t || typeof t !== "object") return null;
+    const rawName = t.name || (t.type === "custom" || t.type === "local_shell" ? "exec_command" : "");
+    const name = rawName === "exec" ? "exec_command" : (rawName || "exec_command");
+    const desc = t.description || "Execute a shell command";
+    const paramsSchema = {
+      type: "object",
+      properties: {
+        cmd: { type: "string", description: "The command to execute" },
+        command: { type: "string", description: "The command to execute" }
+      },
+      required: ["cmd"]
+    };
+    return {
+      type: "function",
+      function: { name, description: desc, parameters: paramsSchema },
+    };
+  };
   if (Array.isArray(params.tools)) {
     chat.tools = params.tools
       .filter((t) => t && typeof t === "object")
-      .map((t) => {
-        const rawName = t.name || (t.type === "custom" || t.type === "local_shell" ? "exec_command" : "");
-        const name = rawName === "exec" ? "exec_command" : (rawName || "exec_command");
-        const desc = t.description || "Execute a shell command";
-        const paramsSchema = {
-          type: "object",
-          properties: {
-            cmd: { type: "string", description: "The command to execute" },
-            command: { type: "string", description: "The command to execute" }
-          },
-          required: ["cmd"]
-        };
-        return {
-          type: "function",
-          function: {
-            name,
-            description: desc,
-            parameters: paramsSchema,
-          },
-        };
-      });
+      .map(mapResponsesTool)
+      .filter(Boolean);
     if (chat.tools.length === 0) delete chat.tools;
   }
+
+  // Codex 后续回合把工具声明放在 input 的 additional_tools 项里（首个回合 tools 为空）。
+  // 这里把它们合并进上游 tools（只保留上游可执行的 exec/apply_patch/shell_command），
+  // 让 deepseek 拿到真实 schema 稳定地发 exec_command DSML，而不是靠模型瞎猜 XML。
+  const additionalTools = Array.isArray(params.input) ? params.input.filter((it) => it && it.type === "additional_tools") : [];
+  const flattenAdditionalTools = () => {
+    const flat = [];
+    for (const it of additionalTools) {
+      const tools = Array.isArray(it.tools) ? it.tools : [];
+      for (const t of tools) {
+        if (!t || typeof t !== "object") continue;
+        if (t.type === "namespace" && Array.isArray(t.tools)) {
+          for (const inner of t.tools) {
+            if (inner && typeof inner === "object") flat.push(inner);
+          }
+        } else {
+          flat.push(t);
+        }
+      }
+    }
+    return flat;
+  };
+  const flatAdditional = flattenAdditionalTools();
+  const execLikeNames = new Set(["exec", "exec_command", "apply_patch", "shell_command", "bash", "read_file", "write_file", "web_search"]);
+  const upstreamAdditional = flatAdditional
+    .filter((t) => execLikeNames.has(t.name))
+    .map(mapResponsesTool)
+    .filter(Boolean);
+  if (upstreamAdditional.length) {
+    const seenNames = new Set((chat.tools || []).map((t) => t.function.name));
+    const merged = chat.tools || [];
+    for (const t of upstreamAdditional) {
+      if (seenNames.has(t.function.name)) continue;
+      seenNames.add(t.function.name);
+      merged.push(t);
+    }
+    chat.tools = merged;
+  }
+
+  // 无任何工具时：Codex 类客户端（首个回合 tools 为空）注入默认 exec_command schema，
+  // 让上游稳定产出可被 sanitize 拦截成 custom_tool_call exec 的调用。
+  if (!Array.isArray(chat.tools) || chat.tools.length === 0) {
+    if (chatShouldSanitize(chat)) {
+      chat.tools = [mapResponsesTool({ type: "custom", name: "exec", description: "Execute a shell command on the user's machine and return its stdout" })];
+    }
+  }
+
+  // 记录客户端原始工具集（含 additional_tools），供下游 sanitizeToolPayload 决定回传 function_call 还是 custom_tool_call。
+  // _clientTools 不是 UPSTREAM_KEYS，buildUpstreamPayload 不会把它转发给上游。
+  chat._clientTools = Array.isArray(params.tools) ? params.tools : [];
+  if (flatAdditional.length) chat._clientTools = chat._clientTools.concat(flatAdditional);
   // Responses tool_choice → chat 格式；仅支持 function 类型，其它对象形式退回 auto
   if (params.tool_choice && typeof params.tool_choice === "object") {
     if (params.tool_choice.type === "function" && params.tool_choice.name) {
@@ -1408,7 +1458,9 @@ function extractToolOutputText(item) {
   if (typeof o === "string") return o;
   if (typeof o === "number" || typeof o === "boolean") return String(o);
   if (Array.isArray(o)) {
-    return o.map(p => typeof p === "string" ? p : (p?.text || p?.content || JSON.stringify(p))).join("");
+    // Codex 的 custom_tool_call_output.output 是 input_text 数组，剔除 "Script completed"/"Wall time" 等元信息
+    const parts = o.map(p => typeof p === "string" ? p : (p?.text || p?.content || JSON.stringify(p)));
+    return parts.filter(p => !/^(Script completed|Wall time)/.test(p.trim())).join("");
   }
   if (typeof o === "object" && o !== null) {
     if (typeof o.stdout === "string" && typeof o.stderr === "string") {
@@ -1459,6 +1511,8 @@ function extractToolOutputText(item) {
     }
 
     if (item.type === "reasoning" || item.type === "item_reference") continue;
+    // additional_tools（工具声明，已在 responsesToChatParams 合并进上游 tools）——不是消息，跳过
+    if (item.type === "additional_tools") continue;
     const role = item.role || "user";
     const content = item.content;
     if (typeof content === "string") {
