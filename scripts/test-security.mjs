@@ -108,6 +108,40 @@ const mkReq = (body, headers) => new Request("https://localhost/v1/chat/completi
   check("S3 known model not 400", res.status !== 400, "status=" + res.status);
 }
 
+// ---------- S3-anth: Anthropic 路径未知模型 → 400（不再静默换成 mimo） ----------
+const mkAnthReq = (path, body) => new Request("https://localhost" + path, { method: "POST", headers: authHdr(AUTH), body: JSON.stringify(body) });
+
+{
+  const res = await worker.fetch(mkAnthReq("/v1/messages", { model: "nonsense/model", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }), ENV);
+  check("S3-anthropic unknown model -> 400", res.status === 400, "status=" + res.status);
+  const j = await res.json();
+  check("S3-anthropic unknown model message mentions not available", /not available/i.test(j?.error?.message || ""), JSON.stringify(j).slice(0, 120));
+}
+
+{
+  const res = await worker.fetch(mkAnthReq("/v1/messages/count_tokens", { model: "nonsense/model", messages: [{ role: "user", content: "hi" }] }), ENV);
+  check("S3-anthropic count_tokens unknown model -> 400", res.status === 400, "status=" + res.status);
+}
+
+{
+  const res = await worker.fetch(mkAnthReq("/v1/messages", { model: "mimo/mimo-v2.5", max_tokens: 16, messages: [{ role: "user", content: "hi" }] }), ENV);
+  check("S3-anthropic known model not 400", res.status !== 400, "status=" + res.status);
+}
+
+// ---------- S2-anth: count_tokens 补全请求结构上限（此前无任何 caps） ----------
+{
+  const messages = [];
+  for (let i = 0; i < 300; i++) messages.push({ role: "user", content: "m" + i });
+  const res = await worker.fetch(mkAnthReq("/v1/messages/count_tokens", { model: "mimo/mimo-v2.5", messages }), ENV);
+  check("S2-anthropic count_tokens messages > 256 -> 400", res.status === 400, "status=" + res.status);
+}
+
+{
+  const big = "x".repeat(1024 * 1024 + 10);
+  const res = await worker.fetch(mkAnthReq("/v1/messages/count_tokens", { model: "mimo/mimo-v2.5", messages: [{ role: "user", content: big }] }), ENV);
+  check("S2-anthropic count_tokens body > 1MiB -> 413", res.status === 413, "status=" + res.status);
+}
+
 // ---------- S4: healthz scrubs token prefixes ----------
 {
   const req = new Request("https://localhost/healthz", { method: "GET" });

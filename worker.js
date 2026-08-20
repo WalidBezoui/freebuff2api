@@ -2,7 +2,7 @@ const CODEBUFF_API = "https://www.codebuff.com";
 // 可被 env.CODEBUFF_API 覆盖的中继地址（fetch 入口每次请求时同步；默认直连官方）
 let activeCodebuffApi = CODEBUFF_API;
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
-const VERSION = "1.9.2";
+const VERSION = "1.9.4";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 输入保护（安全加固）：限制畸形/超大请求，防止不必要地消耗上游额度
@@ -327,7 +327,10 @@ function modelPoolCategory(modelId) {
 // 模型 → session 用模型名 / 上游 agentId / 上游 chat 模型名
 // 只保留 1 个硬编码兜底（极端情况下至少有一个可用）：
 //   - mimo/mimo-v2.5   STANDARD 模型
-// 其余模型全部由动态拉取提供（官方源 → GitHub Releases JSON → 这个兜底）
+// 其余模型全部由动态拉取提供（官方源 → GitHub Releases JSON → 这个兜底）。
+// ⚠️ 注意：laguna-s-2.1 / ling-3.0-flash / greg-2 等已于 2026-08-20 从官方清单移除，
+// 这里保留内置 ID 仅为兼容旧配置（请求会尝试建 session，上游拒绝则回传真实上游错误）。
+// 当前权威模型清单以动态源（freebuff-models.json / MODELS.md）为准。
 const MODELS = [
   { id: "mimo/mimo-v2.5", session: "mimo/mimo-v2.5", agent: "base2-free-mimo", upstream: "mimo/mimo-v2.5" },
   { id: "deepseek/deepseek-v4-flash", session: "deepseek/deepseek-v4-flash", agent: "base2-free-deepseek-flash", upstream: "deepseek/deepseek-v4-flash" },
@@ -398,6 +401,13 @@ export default {
       activeCodebuffApi = env.CODEBUFF_API.trim().replace(/\/+$/, "");
     } else {
       activeCodebuffApi = CODEBUFF_API;
+    }
+    // 同步工具输出上限（0 = 不限；缺省 32KB）
+    if (env && env.FREEBUFF_MAX_TOOL_OUTPUT !== undefined && env.FREEBUFF_MAX_TOOL_OUTPUT !== "") {
+      const v = Number(env.FREEBUFF_MAX_TOOL_OUTPUT);
+      maxToolOutput = Number.isFinite(v) && v >= 0 ? Math.floor(v) : 32768;
+    } else {
+      maxToolOutput = 32768;
     }
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
@@ -1322,7 +1332,9 @@ async function resolveModelConfig(modelId) {
 async function readJsonBody(request) {
   let text;
   try { text = await request.text(); } catch { return { error: jsonResponse({ error: { message: "Invalid request body", type: "parse_error" } }, 400) }; }
-  if (text.length > MAX_BODY_BYTES) {
+  // 按 UTF-8 字节数而非字符数校验（多字节字符时 text.length 会低估真实体积）；
+  // TextEncoder 是 Web 标准 API，Cloudflare Workers 与 Node 均可用（不用 Buffer）。
+  if (new TextEncoder().encode(text).byteLength > MAX_BODY_BYTES) {
     return { error: jsonResponse({ error: { message: "Request body too large (limit " + MAX_BODY_BYTES + " bytes)", type: "invalid_request_error" } }, 413) };
   }
   let params;
@@ -1494,6 +1506,15 @@ function responsesToChatParams(params, mc) {
 }
 
 // Responses API input → chat messages（input 可为字符串或消息条目数组）
+// 工具输出上限（v1.9.4）：exec/Bash 结果过大时截断再回传上游，防止长会话上下文被
+// 一次巨型输出撑爆。模块级变量，fetch() 每次请求同步 env.FREEBUFF_MAX_TOOL_OUTPUT
+// （0 = 不限；默认 32KB，按字符计）。
+let maxToolOutput = 32768;
+function capToolOutput(text) {
+  if (!maxToolOutput || typeof text !== "string" || text.length <= maxToolOutput) return text;
+  return text.slice(0, maxToolOutput) + "\n… [truncated by freebuff2api: " + text.length + " chars total]";
+}
+
 function responsesInputToMessages(input, instructions) {
   const messages = [];
   if (instructions) messages.push({ role: "system", content: instructions });
@@ -1611,7 +1632,7 @@ function extractToolOutputText(item) {
 
     // Standard function_call_output (tool result)
     if (item.type === "function_call_output") {
-      const textOut = extractToolOutputText(item);
+      const textOut = capToolOutput(extractToolOutputText(item));
       messages.push({
         role: "tool",
         name: "exec_command",
@@ -1623,7 +1644,7 @@ function extractToolOutputText(item) {
 
     // Codex v0.147 custom_tool_call_output = exec result
     if (item.type === "custom_tool_call_output") {
-      const outputText = extractToolOutputText(item);
+      const outputText = capToolOutput(extractToolOutputText(item));
       messages.push({
         role: "tool",
         name: "exec_command",
@@ -1968,7 +1989,9 @@ function anthropicModelToOpenAI(model) {
   if (findModelConfig(raw)) return raw;
   const short = raw.replace(/^anthropic\//, "");
   const hit = MODELS.find((m) => m.id.toLowerCase().endsWith("/" + short.toLowerCase()));
-  return hit ? hit.id : DEFAULT_MODEL;
+  // 未知模型不再静默换用 DEFAULT_MODEL（否则 Anthropic 路径绕过 400 unsupported_model）：
+  // 原样返回，由 resolveModelConfig 判定后统一回 400（与 chat/responses 路径一致）。
+  return hit ? hit.id : raw;
 }
 
 function anthropicText(content) {
@@ -2029,7 +2052,7 @@ function anthropicToChat(body, mc) {
       const parts = Array.isArray(m.content) ? m.content : [];
       const results = parts.filter((p) => p && p.type === "tool_result");
       if (results.length) {
-        for (const p of results) chat.messages.push({ role: "tool", tool_call_id: p.tool_use_id || "", content: anthropicText(p.content) });
+        for (const p of results) chat.messages.push({ role: "tool", tool_call_id: p.tool_use_id || "", content: capToolOutput(anthropicText(p.content)) });
         const text = parts.filter((p) => p && p.type === "text" && p.text).map((p) => p.text).join("\n");
         if (text) chat.messages.push({ role: "user", content: text });
       } else chat.messages.push({ role: "user", content: anthropicContent(m.content) });
@@ -2078,10 +2101,15 @@ function estimateAnthropicTokens(value) {
 
 async function handleAnthropicCountTokens(request, env) {
   const { params: body, error } = await readJsonBody(request);
-  if (error) return anthropicError("Invalid JSON", "invalid_request_error", 400);
+  if (error) {
+    const msg = error.status === 413 ? "Request body too large" : "Invalid JSON";
+    return anthropicError(msg, "invalid_request_error", error.status === 413 ? 413 : 400);
+  }
   const openaiModel = anthropicModelToOpenAI(body.model);
   const mc = await resolveModelConfig(openaiModel);
   if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
+  const capErr = bodyCapsViolation(body);
+  if (capErr) return anthropicError(capErr, "invalid_request_error", 400);
   const chat = anthropicToChat(body, mc);
   return jsonResponse({ input_tokens: Math.max(1, Math.ceil(estimateAnthropicTokens(chat.messages) / 4)) }, 200);
 }
@@ -2222,6 +2250,15 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
   const chunkId = "chatcmpl_" + Math.random().toString(36).slice(2, 12);
   let buf = "", model = "", usage = null, finishReason = null, sawUpstreamDone = false, upstreamError = null;
 
+  // SSE 保活（v1.9.4）：深度推理期间上游可能 >10s 无字节，客户端侧可能因静默超时。
+  // 每 5s 检查一次，最近 10s 无任何上游数据时发 SSE 注释行（合法且客户端忽略）。
+  let lastWriteAt = Date.now();
+  const keepAlive = setInterval(() => {
+    if (Date.now() - lastWriteAt > 10000) {
+      writer.write(encoder.encode(": keep-alive\n\n")).catch(() => {});
+    }
+  }, 5000);
+
   const sendObj = (obj) => writer.write(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
   const emitChunk = (delta, extra = {}) => sendObj({
     id: chunkId, object: "chat.completion.chunk", model,
@@ -2293,6 +2330,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
         if (upstreamError) break;
         const { done, value } = await reader.read();
         if (done) break;
+        if (value && value.byteLength) lastWriteAt = Date.now();
         buf += decoder.decode(value, { stream: true });
         let idx;
         while ((idx = buf.indexOf("\n")) >= 0) {
@@ -2369,6 +2407,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
       } catch {}
     }
     finally {
+      try { if (keepAlive) clearInterval(keepAlive); } catch {}
       try { if (onComplete) await onComplete(); } catch {}
       try { await writer.close(); } catch {}
       // R2：客户端断开/异常时取消上游流，尽快释放 session/额度
@@ -3036,9 +3075,18 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       await send({ type: "response.created", response: responsesBase(mc, respId, createdAt, requestParams) });
       await send({ type: "response.in_progress", response: responsesBase(mc, respId, createdAt, requestParams) });
 
+      // SSE 保活（v1.9.4）：深度推理期间上游可能长时间无字节，客户端可能静默超时
+      let lastWriteAt = Date.now();
+      const keepAlive = setInterval(() => {
+        if (Date.now() - lastWriteAt > 10000) {
+          writer.write(encoder.encode(": keep-alive\n\n")).catch(() => {});
+        }
+      }, 5000);
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        if (value && value.byteLength) lastWriteAt = Date.now();
         buf += decoder.decode(value, { stream: true });
         let idx;
         while ((idx = buf.indexOf("\n")) >= 0) {
@@ -3326,6 +3374,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         await send({ type: "response.failed", response: failed });
       } catch {}
     } finally {
+      try { if (keepAlive) clearInterval(keepAlive); } catch {}
       try { if (onComplete) await onComplete(); } catch {}
       try { await writer.close(); } catch {}
       // R2：无论成败都取消上游流，尽快释放 session/额度
@@ -3500,9 +3549,14 @@ async function handleModels() {
       modelList = mergeModelTables(MODELS, dyn.models);
     }
   } catch {}
+  // v1.9.4：附带 context_window / supports_reasoning，让 Claude Code 网关模型发现
+  // 能正确按上下文窗口做截断管理，Codex 也能按需读取（缺省 131072，与 ~/.codex/config.toml 一致）
   return jsonResponse({
     object: "list",
-    data: modelList.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
+    data: modelList.map((m) => ({
+      id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff",
+      context_window: 131072, supports_reasoning: true,
+    })),
   }, 200, { "X-Freebuff2api-Version": VERSION });
 }
 

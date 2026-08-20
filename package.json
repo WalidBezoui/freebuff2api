@@ -1,6 +1,6 @@
 {
   "name": "freebuff2api-container",
-  "version": "1.9.2",
+  "version": "1.9.4",
   "type": "module",
   "private": true,
   "description": "freebuff2api v1.9.2 worker.js running in Node container",

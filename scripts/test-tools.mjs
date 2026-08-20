@@ -954,6 +954,80 @@ async function readRawSSE(res) {
   }
 }
 
+// ---------- T41: 工具输出上限（Codex /v1/responses 路径，FREEBUFF_MAX_TOOL_OUTPUT=100） ----------
+{
+  currentStream = [{ id: "cmpl", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } }];
+  upstreamChatBodies = [];
+  const big = "Z".repeat(5000);
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: false,
+      input: [
+        { role: "user", content: "run ls" },
+        { type: "function_call", call_id: "call_1", name: "exec", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_1", output: big },
+      ],
+    }),
+  });
+  await worker.fetch(req, { ...ENV, FREEBUFF_MAX_TOOL_OUTPUT: "100" });
+  const up = upstreamChatBodies[upstreamChatBodies.length - 1];
+  const toolMsg = (up?.body?.messages || []).find((m) => m.role === "tool");
+  const t41detail = JSON.stringify({ nBodies: upstreamChatBodies.length, upExists: !!up, roles: (up?.body?.messages || []).map((m) => m.role), toolLen: toolMsg?.content?.length });
+  check("T41 Codex tool output capped (marker present)", !!toolMsg && toolMsg.content.includes("truncated by freebuff2api"), t41detail);
+  check("T41 Codex tool output length capped", !!toolMsg && toolMsg.content.length < 5000 && toolMsg.content.length > 100, "len=" + (toolMsg?.content?.length));
+}
+
+// ---------- T42: FREEBUFF_MAX_TOOL_OUTPUT=0 关闭截断 ----------
+{
+  currentStream = [{ id: "cmpl", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } }];
+  upstreamChatBodies = [];
+  const big = "Z".repeat(5000);
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: false,
+      input: [
+        { role: "user", content: "run ls" },
+        { type: "function_call", call_id: "call_1", name: "exec", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_1", output: big },
+      ],
+    }),
+  });
+  await worker.fetch(req, { ...ENV, FREEBUFF_MAX_TOOL_OUTPUT: "0" });
+  const up = upstreamChatBodies[upstreamChatBodies.length - 1];
+  const toolMsg = (up?.body?.messages || []).find((m) => m.role === "tool");
+  check("T42 FREEBUFF_MAX_TOOL_OUTPUT=0 -> uncapped", !!toolMsg && toolMsg.content === big, "len=" + (toolMsg?.content?.length));
+}
+
+// ---------- T43: /v1/models 附带 context_window / supports_reasoning ----------
+{
+  const req = new Request("https://localhost/v1/models", { method: "GET", headers: AUTH });
+  const res = await worker.fetch(req, ENV);
+  const j = await res.json();
+  const m = (j?.data || []).find((x) => x.id === MODEL);
+  check("T43 /v1/models has context_window", !!m && m.context_window === 131072, JSON.stringify(m).slice(0, 120));
+  check("T43 /v1/models has supports_reasoning", !!m && m.supports_reasoning === true, JSON.stringify(m).slice(0, 120));
+}
+
+// ---------- T44: 工具输出上限（Anthropic /v1/messages 路径 tool_result） ----------
+{
+  currentStream = [{ id: "cmpl", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } }];
+  upstreamChatBodies = [];
+  const big = "Q".repeat(5000);
+  const req = new Request("https://localhost/v1/messages", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, max_tokens: 64,
+      messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: big }] }],
+    }),
+  });
+  await worker.fetch(req, { ...ENV, FREEBUFF_MAX_TOOL_OUTPUT: "100" });
+  const up = upstreamChatBodies[upstreamChatBodies.length - 1];
+  const toolMsg = (up?.body?.messages || []).find((m) => m.role === "tool");
+  check("T44 Anthropic tool_result capped (marker present)", !!toolMsg && toolMsg.content.includes("truncated by freebuff2api"), JSON.stringify(toolMsg).slice(0, 120));
+}
+
 const failed = results.filter((r) => !r.ok);
 console.log("\n=== " + (results.length - failed.length) + "/" + results.length + " passed ===");
 process.exit(failed.length ? 1 : 0);

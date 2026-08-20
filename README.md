@@ -163,6 +163,7 @@ docker compose up -d --build
 |---|---|
 | `PORT` / `HOST` | 监听端口/地址，默认 `8787` / `0.0.0.0` |
 | `FREEBUFF_API_KEY` | 本 API 访问 key。**必填**：未配置时所有请求返回 401（不设默认密钥后门） |
+| `FREEBUFF_MAX_TOOL_OUTPUT` | 工具（exec/Bash）结果回传上游前的最大长度（字符），`0`=不限，缺省 `32768`；防止长会话上下文被巨型输出撑爆 |
 | `FREEBUFF_DEBUG` | `true` 开启请求级调试日志 |
 
 > ⚠️ 容器内 `credentials/` 以只读方式挂载；`server.js` 启动时读取并组装 `FREEBUFF_TOKEN`（多账号逗号分隔）。
@@ -285,12 +286,14 @@ curl -N https://你的worker.workers.dev/v1/chat/completions \
 | `minimax/minimax-m3` | 同左 | `base2-free-minimax-m3` |
 | `deepseek/deepseek-v4-pro` | 同左 | `base2-free-deepseek` |
 | `openai/gpt-5.6-luna` | 同左 | `base2-free-luna` |
-| `poolside/laguna-s-2.1` | 同左 | `base2-free-laguna-s-2-1` |
-| `openrouter/poolside/laguna-s-2.1` | 同左 | `base2-free-laguna-s-2-1-openrouter` |
-| `inclusionai/ling-3.0-flash:free` | 同左 | `base2-free-ling-3-flash` |
-| `crof/greg-2-ultra` | 同左 | `base2-free-greg-2-ultra` |
-| `crof/greg-2-super` | 同左 | `base2-free-greg-2-super` |
 | `meta/muse-spark-1.2-contributor` | 同左 | `base2-free-muse-spark` |
+| `poolside/laguna-s-2.1` \* | 同左 | `base2-free-laguna-s-2-1` |
+| `openrouter/poolside/laguna-s-2.1` \* | 同左 | `base2-free-laguna-s-2-1-openrouter` |
+| `inclusionai/ling-3.0-flash:free` \* | 同左 | `base2-free-ling-3-flash` |
+| `crof/greg-2-ultra` \* | 同左 | `base2-free-greg-2-ultra` |
+| `crof/greg-2-super` \* | 同左 | `base2-free-greg-2-super` |
+
+> \* 上游已于 2026-08-20 从官方模型清单移除（见 `MODELS.md` 最新 9 模型）。Worker 保留这些内置 ID 用于兼容旧配置：请求仍会尝试创建 session，若上游拒绝会回传真实上游错误（非本代理映射失效）。
 
 ### 🎁 独立资格或容量限制
 
