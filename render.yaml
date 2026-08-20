@@ -8,6 +8,6 @@ services:
     startCommand: "node server.js"
     envVars:
       - key: FREEBUFF_API_KEY
-        value: freebuff-default-key
+        sync: false # 必填：在 Render Dashboard 设置；无默认密钥（fail-closed）
       - key: FREEBUFF_TOKEN
         sync: false # Set in Render Dashboard

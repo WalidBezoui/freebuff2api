@@ -24,12 +24,15 @@ CRED_FILE = Path(__file__).resolve().parent / "freebuff_credentials.json"
 REQUEST_TIMEOUT = 10
 
 SUPPORTED_MODELS = [
-    ("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash", "Fastest Coding / High Reasoning"),
-    ("deepseek/deepseek-v4-pro",   "DeepSeek V4 Pro",   "Deepest Reasoning / Refactoring"),
-    ("openai/gpt-5.6-luna",        "GPT-5.6 Luna",      "OpenAI Flagship Coding Model"),
-    ("minimax/minimax-m3",         "MiniMax M3",        "Multilingual Code Reasoning"),
-    ("mimo/mimo-v2.5",             "MiMo 2.5",          "Fast Balanced Assistant"),
-    ("z-ai/glm-5.2",               "GLM 5.2",           "Z-AI High-Speed Reasoning")
+    ("deepseek/deepseek-v4-flash",     "DeepSeek V4 Flash",     "Premium · Fast Coding / High Reasoning"),
+    ("deepseek/deepseek-v4-pro",       "DeepSeek V4 Pro",       "Premium · Deepest Reasoning / Refactoring"),
+    ("openai/gpt-5.6-luna",            "GPT-5.6 Luna",          "Premium · OpenAI Flagship Coding Model"),
+    ("crof/kimi-k3-eco",               "Kimi K3 Eco",           "Premium · CROF Balanced Model"),
+    ("meta/muse-spark-1.2-contributor","Muse Spark 1.2",        "Premium · Meta Contributor, Limited"),
+    ("minimax/minimax-m3",             "MiniMax M3",            "Standard · Multilingual Code Reasoning"),
+    ("mimo/mimo-v2.5",                 "MiMo 2.5",              "Standard · Fast Balanced Assistant"),
+    ("anthropic/claude-fable-5",       "Claude Fable 5",        "Standard · Anthropic, Limited"),
+    ("z-ai/glm-5.2",                   "GLM 5.2",               "GLM Pool · Z-AI High-Speed Reasoning"),
 ]
 
 def clear_screen():

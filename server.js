@@ -2,6 +2,9 @@ import { createServer } from 'node:http';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadDotEnv } from './load-env.mjs';
+
+loadDotEnv();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -59,13 +62,19 @@ if (envToken) {
 
 const env = {
   FREEBUFF_TOKEN: tokenLines.join(','),
-  FREEBUFF_API_KEY: process.env.FREEBUFF_API_KEY || 'freebuff-default-key',
+  // 不设默认密钥：未配置时所有请求 fail-closed（worker.getApiKey 返回 null → 401）。
+  // 如需本地开发，请在 .env 或环境变量中显式设置 FREEBUFF_API_KEY。
+  FREEBUFF_API_KEY: (process.env.FREEBUFF_API_KEY || '').trim(),
   FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
   CODEBUFF_API: process.env.CODEBUFF_API || '',
   RELAY_KEY: process.env.RELAY_KEY || '',
 };
 
-console.log(`[server] start: ${tokenLines.length} tokens, apiKey=${env.FREEBUFF_API_KEY.slice(0,8)}..., debug=${env.FREEBUFF_DEBUG}`);
+if (!env.FREEBUFF_API_KEY) {
+  console.warn('[server] ⚠️ FREEBUFF_API_KEY 未配置：所有请求将返回 401（fail-closed，无默认密钥）');
+}
+
+console.log(`[server] start: ${tokenLines.length} tokens, apiKey=${env.FREEBUFF_API_KEY ? env.FREEBUFF_API_KEY.slice(0, 8) + "..." : "(unset)"}, debug=${env.FREEBUFF_DEBUG}`);
 if (env.CODEBUFF_API) console.log(`[server] CODEBUFF_API=${env.CODEBUFF_API}`);
 if (env.RELAY_KEY) console.log(`[server] RELAY_KEY set`);
 

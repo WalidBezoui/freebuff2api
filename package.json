@@ -1,12 +1,12 @@
 {
   "name": "freebuff2api-container",
-  "version": "1.7.0",
+  "version": "1.9.2",
   "type": "module",
   "private": true,
-  "description": "freebuff2api-wokers v1.6.5 worker.js running in Node container",
+  "description": "freebuff2api v1.9.2 worker.js running in Node container",
   "scripts": {
     "start": "node server.js",
-    "test": "node --check worker.js && node scripts/test-tools.mjs && node scripts/test-codex-replay.mjs",
+    "test": "node --check worker.js && node scripts/check-fixtures.mjs && node scripts/test-tools.mjs && node scripts/test-codex-replay.mjs && node scripts/test-security.mjs",
     "test:live": "node scripts/test-live.mjs"
   },
   "engines": {

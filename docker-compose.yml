@@ -3,7 +3,7 @@ version: "3.8"
 services:
   freebuff2api:
     build: .
-    image: freebuff2api:1.7.0
+    image: freebuff2api:1.9.2
     container_name: freebuff2api
     restart: unless-stopped
     ports:

@@ -5,14 +5,15 @@ echo ====================================================
 echo             Claude Code - Powered by Freebuff
 echo ====================================================
 echo Endpoint: https://freebuff2api-walid-bezouis-projects-fc73dfba.vercel.app
-echo API Key : freebuff-default-key
-echo Model   : deepseek/deepseek-v4-flash (effort max)
+echo API Key : %FREEBUFF_API_KEY%  (set env FREEBUFF_API_KEY — required since v1.9.2)
+echo Model   : deepseek/deepseek-v4-flash (effort max, small-fast-model = flash)
 echo ====================================================
 echo.
 
 set ANTHROPIC_BASE_URL=https://freebuff2api-walid-bezouis-projects-fc73dfba.vercel.app
-set ANTHROPIC_API_KEY=freebuff-default-key
+set ANTHROPIC_API_KEY=%FREEBUFF_API_KEY%
 set ANTHROPIC_MODEL=deepseek/deepseek-v4-flash
+set ANTHROPIC_SMALL_FAST_MODEL=deepseek/deepseek-v4-flash
 set CLAUDE_CODE_EFFORT_LEVEL=max
 set MAX_THINKING_TOKENS=32000
 set CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=true

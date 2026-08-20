@@ -1,7 +1,15 @@
 const CODEBUFF_API = "https://www.codebuff.com";
+// 可被 env.CODEBUFF_API 覆盖的中继地址（fetch 入口每次请求时同步；默认直连官方）
+let activeCodebuffApi = CODEBUFF_API;
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
-const VERSION = "1.9.1";
+const VERSION = "1.9.2";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
+
+// 输入保护（安全加固）：限制畸形/超大请求，防止不必要地消耗上游额度
+const MAX_BODY_BYTES = 1024 * 1024; // 请求体上限 1MiB
+const MAX_MESSAGES = 256;           // 单请求消息条数上限
+const MAX_TOOLS = 32;               // 单请求工具声明上限
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 单请求图片负载上限 5MiB
 
 // 动态模型注册表：从官方 freebuff 镜像拉取模型清单
 // 真源: https://github.com/CodebuffAI/freebuff (freebuff-private 的 public 镜像)
@@ -385,6 +393,12 @@ const DESKTOP_INCLUDE_RATE_LIMITS = { "x-freebuff-include-unused-rate-limits": "
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    // 同步上游基址：env.CODEBUFF_API 非空时覆盖默认直连地址
+    if (env && typeof env.CODEBUFF_API === "string" && env.CODEBUFF_API.trim()) {
+      activeCodebuffApi = env.CODEBUFF_API.trim().replace(/\/+$/, "");
+    } else {
+      activeCodebuffApi = CODEBUFF_API;
+    }
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
@@ -493,19 +507,22 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
     state,
     uid: extra.uid || previous.uid || null,
     quota: extra.quota || previous.quota || null,
-    retryAfterMs: typeof extra.retryAfterMs === "number" ? extra.retryAfterMs : previous.retryAfterMs || null,
+    // 成功观察（ok）清除历史 retryAfterMs；仅新的明确值才覆盖——避免旧 429 的
+    // 超大 retryAfterMs 在后续成功请求后仍长期钉住账号（审计 R4）。
+    retryAfterMs: state === "ok" ? null : (typeof extra.retryAfterMs === "number" ? extra.retryAfterMs : previous.retryAfterMs || null),
     checkedAt: Date.now(),
   });
 }
 
 function summarizeAccountHealth(pool, health) {
-  const account_details = pool.map((acct) => {
+  const account_details = pool.map((acct, index) => {
     const info = health.get(acct.token);
     return {
-      token: acct.token.slice(0, 8) + "...",
+      // 不暴露 token 前缀/UID 指纹：只给稳定序号（公开 healthz 安全）
+      token: "acct-" + (index + 1),
       alive: info ? info.alive : null,
       state: info?.state || "unknown",
-      uid: info?.uid ? info.uid.slice(0, 8) + "..." : null,
+      uid: info?.uid ? info.uid.slice(0, 4) + "..." : null,
     };
   });
   const account_states = {};
@@ -574,7 +591,13 @@ const alivePool = pool.filter((acct) => {
     if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return acct;
   }
   const oldest = [...cooldowns.entries()].sort((a, b) => a[1] - b[1])[0];
-  if (oldest) cooldowns.delete(oldest[0]);
+  if (oldest) {
+    // 淘汰最早的冷却，并返回那个号（它刚被解除冷却，且必然属于账号池）。
+    // 原实现返回 finalPool[0]，可能与被淘汰的不是同一号，导致返回的号仍在冷却中。
+    cooldowns.delete(oldest[0]);
+    const evicted = finalPool.find((a) => a.token === oldest[0]);
+    if (evicted) return evicted;
+  }
   return finalPool[0];
 }
 
@@ -610,8 +633,11 @@ function logAccountRoute(enabled, pool, token, model, attempt, reason) {
 }
 
 function cooldown(token, ms) {
-  if (ms > 0) cooldowns.set(token, Date.now() + ms);
+  if (ms > 0) cooldowns.set(token, Date.now() + Math.min(ms, MAX_COOLDOWN_MS));
 }
+
+// 冷却上限：与 parseCooldown 的 6h 上限一致；防止某个旧观察值把账号永久钉死
+const MAX_COOLDOWN_MS = 6 * 3600 * 1000;
 
 // Official Freebuff session-gate recovery requires matching both the HTTP
 // status and the relayed error code. Do not treat session_limit_reached or
@@ -754,7 +780,7 @@ async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPST
   if (body !== undefined) headers["Content-Type"] = "application/json";
   Object.assign(headers, extraHeaders);
 
-  const resp = await fetch(CODEBUFF_API + path, {
+  const resp = await fetch(activeCodebuffApi + path, {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -919,7 +945,24 @@ async function runNormalClientBehavior(token, clientFingerprint) {
   return failures;
 }
 
+const pendingSessions = new Map(); // `${token}:${sessionModel}` -> 在途创建 promise（同 isolate 内去重，防止并发双 POST 烧额度）
+
 async function createSession(token, sessionModel, forceCreate = false) {
+  const cacheKey = token + ":" + sessionModel;
+  // 同 isolate 内已有该 (token,model) 的创建请求在途：直接复用之（R2 双建防护，
+  // 仅在同一 isolate 内有效；跨 isolate 竞争是 stateless worker 的已知局限）。
+  if (!forceCreate && pendingSessions.has(cacheKey)) {
+    return pendingSessions.get(cacheKey);
+  }
+  const p = doCreateSession(token, sessionModel, forceCreate);
+  if (!forceCreate) {
+    pendingSessions.set(cacheKey, p);
+    p.then(() => pendingSessions.delete(cacheKey), () => pendingSessions.delete(cacheKey));
+  }
+  return p;
+}
+
+async function doCreateSession(token, sessionModel, forceCreate = false) {
   // 0) 正常客户端行为：广告链 + usage 触碰（30 分钟节流，失败静默）
   try { await runNormalClientBehavior(token, stableFingerprint(token)); } catch {}
   // 1) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
@@ -948,7 +991,9 @@ async function createSession(token, sessionModel, forceCreate = false) {
         sessCache.set(token + ":" + sessionModel, s);
         return s;
       }
-      await deleteUpstreamSession(token, cur.data.instanceId);
+      // 上游已有另一模型的活跃 session：不再 DELETE 它（跨 isolate 删除会杀掉
+      // 其它请求正在使用的流，审计 R1/2.4）。直接 POST 新 session——服务端会自然
+      // 顶替（supersede）旧实例，与本代理的常规会话轮换语义一致。
     }
   }
 
@@ -972,9 +1017,11 @@ async function createSession(token, sessionModel, forceCreate = false) {
   }
   if (r.status === 200 && r.data?.status === "queued" && r.data?.instanceId) {
     const inst = r.data.instanceId;
-    for (let i = 0; i < 8; i++) {
-      await sleep(1500);
-      const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS);
+    // 轮询次数/单次超时都收敛，避免长时间占用全局串行队列（审计 F12）：
+    // 5 次 × 1s 间隔 ≈ 6s 窗口，GET 单次 5s 超时封顶
+    for (let i = 0; i < 5; i++) {
+      await sleep(1000);
+      const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, 5000);
       recordAccountObservation(token, q.status, q.data, {
         quota: q.data?.rateLimitsByModel || null,
         uid: q.data?.uid || null,
@@ -1267,28 +1314,77 @@ async function resolveModelConfig(modelId) {
   } catch {}
   hit = findModelConfig(modelId);
   if (hit) return hit;
-  // Fallback unknown model requests to DEFAULT_MODEL (deepseek/deepseek-v4-flash)
-  return findModelConfig(DEFAULT_MODEL) || (dynamicModelsCache.models?.find((m) => m.id === DEFAULT_MODEL)) || null;
+  // 已明确请求未知模型时不静默换用默认模型：返回 null，由调用方回 400 unsupported_model。
+  return null;
+}
+
+// 带体积上限的 JSON 请求体读取（body 上限 1MiB，超限 413）
+async function readJsonBody(request) {
+  let text;
+  try { text = await request.text(); } catch { return { error: jsonResponse({ error: { message: "Invalid request body", type: "parse_error" } }, 400) }; }
+  if (text.length > MAX_BODY_BYTES) {
+    return { error: jsonResponse({ error: { message: "Request body too large (limit " + MAX_BODY_BYTES + " bytes)", type: "invalid_request_error" } }, 413) };
+  }
+  let params;
+  try { params = JSON.parse(text); } catch { return { error: jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400) }; }
+  if (!params || typeof params !== "object") return { error: jsonResponse({ error: { message: "Request body must be a JSON object", type: "parse_error" } }, 400) };
+  return { params };
+}
+
+// 请求结构上限校验（消息数/工具数/图片负载），返回违规描述或 null
+function bodyCapsViolation(params) {
+  const messages = Array.isArray(params.messages) ? params.messages : [];
+  const input = Array.isArray(params.input) ? params.input : [];
+  if (messages.length > MAX_MESSAGES) return "messages exceeds limit of " + MAX_MESSAGES;
+  if (input.length > MAX_MESSAGES) return "input exceeds limit of " + MAX_MESSAGES;
+  const tools = Array.isArray(params.tools) ? params.tools : [];
+  if (tools.length > MAX_TOOLS) return "tools exceeds limit of " + MAX_TOOLS;
+  let imageBytes = 0;
+  const scanContent = (content) => {
+    if (!Array.isArray(content)) return;
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      if (part.type === "image_url" && typeof part.image_url?.url === "string") {
+        const u = part.image_url.url;
+        if (u.startsWith("data:")) {
+          const comma = u.indexOf(",");
+          imageBytes += comma >= 0 ? u.length - comma : u.length;
+        }
+      } else if (part.type === "image" && part.source?.type === "base64" && typeof part.source.data === "string") {
+        imageBytes += part.source.data.length;
+      }
+    }
+  };
+  for (const m of messages) if (m && typeof m === "object") scanContent(m.content);
+  for (const it of input) {
+    if (it && typeof it === "object" && Array.isArray(it.content)) scanContent(it.content);
+  }
+  if (imageBytes > MAX_IMAGE_BYTES) return "image payload exceeds limit of " + MAX_IMAGE_BYTES + " bytes";
+  return null;
 }
 
 async function handleChat(request, env) {
-  let params;
-  try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
+  const { params, error } = await readJsonBody(request);
+  if (error) return error;
   const isStream = !!params.stream;
   const requestedModel = params.model || DEFAULT_MODEL;
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
+  const capErr = bodyCapsViolation(params);
+  if (capErr) return jsonResponse({ error: { message: capErr, type: "invalid_request_error" } }, 400);
   return executeChat(env, params, mc, isStream, "chat");
 }
 
 // OpenAI Responses API（/v1/responses）入口：把 Responses 请求翻译成 chat completions 上游调用
 async function handleResponses(request, env) {
-  let params;
-  try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
+  const { params, error } = await readJsonBody(request);
+  if (error) return error;
   const isStream = !!params.stream;
   const requestedModel = params.model || DEFAULT_MODEL;
   const mc = await resolveModelConfig(requestedModel);
   if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
+  const capErr = bodyCapsViolation(params);
+  if (capErr) return jsonResponse({ error: { message: capErr, type: "invalid_request_error" } }, 400);
   return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses", { requestParams: params });
 }
 
@@ -1614,7 +1710,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
         "Content-Type": "application/json",
         "x-freebuff-instance-id": sess.instanceId,
       };
-      const resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
+      const resp = await fetch(activeCodebuffApi + "/api/v1/chat/completions", {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
@@ -1711,8 +1807,8 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
         };
         try {
           resp = isStream
-            ? await fetchStreamWithQuotaGuard(CODEBUFF_API + "/api/v1/chat/completions", chatInit, token, mc.session)
-            : await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
+            ? await fetchStreamWithQuotaGuard(activeCodebuffApi + "/api/v1/chat/completions", chatInit, token, mc.session)
+            : await fetch(activeCodebuffApi + "/api/v1/chat/completions", {
                 ...chatInit,
                 signal: AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
               });
@@ -1721,6 +1817,8 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
           // 删除上游旧实例，重建同模型 session，再重试一次；绝不改成别的模型。
           if (error instanceof EmptyUpstreamStreamError && attempt === 0) {
             await deleteUpstreamSession(token, sessForChat.instanceId);
+            // session 重建后 run_id 可能已失效（审计 2.3）：连同 run 链缓存一起清掉
+            runCache.delete(token + ":" + mc.agent);
             if (debug) console.log(`[acct ${acctTry + 1}][chat] empty stream, same-model session recovery`);
             sessForChat = await createSession(token, mc.session, true);
             continue;
@@ -1742,6 +1840,8 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
         if (staleSession && attempt === 0) {
           await deleteUpstreamSession(token, sessForChat.instanceId);
           sessCache.delete(token + ":" + mc.session);
+          // run_id 绑定旧 session：重建后必须失效缓存，否则带旧 run_id 的 chat 持续 502（审计 2.3）
+          runCache.delete(token + ":" + mc.agent);
           if (debug) console.log(`[acct ${acctTry + 1}][chat] session stale (${resp.status}), recreate…`);
           sessForChat = await createSession(token, mc.session, true);
           continue;
@@ -1767,46 +1867,72 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
 
-      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc, chatParams?._clientTools || [], isDsmlPassthrough(chatParams), requestParams), 200);
-
-      const agg = await streamToNonStream(resp.body, mc.upstream);
-      // 非流式 chat 同样过滤 DSML/XML：清理 content，并统一净化/合并原生+XML 工具调用
-      if (chatShouldSanitize(chatParams) && agg?.choices?.[0]?.message) {
-        const msg = agg.choices[0].message;
-        const clientTools = chatParams?._clientTools || chatParams?.tools || [];
-        const raw = msg.content || "";
-        if (raw) {
-          const parsed = parseXmlToolCallsAndCommentary(raw, clientTools, preserveToolNames);
-          msg.content = parsed.cleanedText || "";
-        }
-        const cleaned = [];
-        const seen = new Set();
-        for (const tc of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
-          const fn = tc.function || {};
-          let s;
-          try {
-            const rawObj = typeof fn.arguments === "string" && fn.arguments.startsWith("{") ? JSON.parse(fn.arguments) : fn.arguments;
-            s = sanitizeToolPayload(fn.name, rawObj, clientTools, preserveToolNames);
-          } catch {
-            s = sanitizeToolPayload(fn.name, { command: fn.arguments }, clientTools, preserveToolNames);
+      // 非流式空 200 重试（审计 2.7）：聚合时发现空流（脏 session）→ 与流式路径一致，
+      // 删除旧实例、清缓存、重建同模型 session 后重发一次；绝不静默返回空成功。
+      const finalizeNonStream = async (body) => {
+        if (mode === "responses") return responsesToNonStream(body, mc, chatParams?._clientTools || [], isDsmlPassthrough(chatParams), requestParams);
+        const agg = await streamToNonStream(body, mc.upstream);
+        // 非流式 chat 同样过滤 DSML/XML：清理 content，并统一净化/合并原生+XML 工具调用
+        if (chatShouldSanitize(chatParams) && agg?.choices?.[0]?.message) {
+          const msg = agg.choices[0].message;
+          const clientTools = chatParams?._clientTools || chatParams?.tools || [];
+          const raw = msg.content || "";
+          if (raw) {
+            const parsed = parseXmlToolCallsAndCommentary(raw, clientTools, preserveToolNames);
+            msg.content = parsed.cleanedText || "";
           }
-          if (s.drop) continue; // 客户端未声明的工具调用 → 丢弃
-          const key = s.fnName + "::" + s.args;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          cleaned.push({ id: tc.id, type: "function", function: { name: s.fnName, arguments: typeof s.args === "string" ? s.args : JSON.stringify(s.args) } });
-        }
-        if (raw) {
-          const parsed = parseXmlToolCallsAndCommentary(raw, clientTools);
-          for (const tc of parsed.toolCalls) {
-            const key = tc.name + "::" + tc.arguments;
+          const cleaned = [];
+          const seen = new Set();
+          for (const tc of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
+            const fn = tc.function || {};
+            let s;
+            try {
+              const rawObj = typeof fn.arguments === "string" && fn.arguments.startsWith("{") ? JSON.parse(fn.arguments) : fn.arguments;
+              s = sanitizeToolPayload(fn.name, rawObj, clientTools, preserveToolNames);
+            } catch {
+              s = sanitizeToolPayload(fn.name, { command: fn.arguments }, clientTools, preserveToolNames);
+            }
+            if (s.drop) continue; // 客户端未声明的工具调用 → 丢弃
+            const key = s.fnName + "::" + s.args;
             if (seen.has(key)) continue;
             seen.add(key);
-            cleaned.push({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.arguments } });
+            cleaned.push({ id: tc.id, type: "function", function: { name: s.fnName, arguments: typeof s.args === "string" ? s.args : JSON.stringify(s.args) } });
           }
+          if (raw) {
+            const parsed = parseXmlToolCallsAndCommentary(raw, clientTools);
+            for (const tc of parsed.toolCalls) {
+              const key = tc.name + "::" + tc.arguments;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              cleaned.push({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.arguments } });
+            }
+          }
+          msg.tool_calls = cleaned.length ? cleaned : undefined;
+          if (cleaned.length) agg.choices[0].finish_reason = "tool_calls";
         }
-        msg.tool_calls = cleaned.length ? cleaned : undefined;
-        if (cleaned.length) agg.choices[0].finish_reason = "tool_calls";
+        return agg;
+      };
+
+      let agg;
+      try {
+        agg = await finalizeNonStream(resp.body);
+      } catch (error) {
+        if (!(error instanceof EmptyUpstreamStreamError)) throw error;
+        await deleteUpstreamSession(token, sessForChat.instanceId);
+        sessCache.delete(token + ":" + mc.session);
+        runCache.delete(token + ":" + mc.agent);
+        if (debug) console.log(`[acct ${acctTry + 1}][chat] empty non-stream, same-model session recovery`);
+        sessForChat = await createSession(token, mc.session, true);
+        const retryPayload = buildUpstreamPayload(chatParams, mc, sessForChat, run.runId);
+        const retryResp = await fetch(activeCodebuffApi + "/api/v1/chat/completions", {
+          method: "POST",
+          headers: { Authorization: "Bearer " + token, "Content-Type": "application/json", "x-freebuff-instance-id": sessForChat.instanceId },
+          body: JSON.stringify(retryPayload),
+          signal: AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
+        });
+        if (!retryResp.ok) throw new Error("upstream error: " + retryResp.status + " " + (await retryResp.text()).slice(0, 300));
+        recordAccountObservation(token, retryResp.status, null);
+        agg = await finalizeNonStream(retryResp.body);
       }
       return jsonResponse(agg, 200);
     } catch (e) {
@@ -1903,7 +2029,7 @@ function anthropicToChat(body, mc) {
       const parts = Array.isArray(m.content) ? m.content : [];
       const results = parts.filter((p) => p && p.type === "tool_result");
       if (results.length) {
-        for (const p of results) chat.messages.push({ role: "tool", tool_call_id: p.tool_use_id || "", content: anthropicContent(p.content) });
+        for (const p of results) chat.messages.push({ role: "tool", tool_call_id: p.tool_use_id || "", content: anthropicText(p.content) });
         const text = parts.filter((p) => p && p.type === "text" && p.text).map((p) => p.text).join("\n");
         if (text) chat.messages.push({ role: "user", content: text });
       } else chat.messages.push({ role: "user", content: anthropicContent(m.content) });
@@ -1951,8 +2077,8 @@ function estimateAnthropicTokens(value) {
 }
 
 async function handleAnthropicCountTokens(request, env) {
-  let body;
-  try { body = await request.json(); } catch { return anthropicError("Invalid JSON", "invalid_request_error", 400); }
+  const { params: body, error } = await readJsonBody(request);
+  if (error) return anthropicError("Invalid JSON", "invalid_request_error", 400);
   const openaiModel = anthropicModelToOpenAI(body.model);
   const mc = await resolveModelConfig(openaiModel);
   if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
@@ -1963,12 +2089,34 @@ async function handleAnthropicCountTokens(request, env) {
 function anthropicStream(mc) {
   const decoder = new TextDecoder();
   let buffer = "", started = false, ended = false, block = null, blockIndex = -1, reason = "end_turn", input = 0, output = 0;
+  // 工具增量缓冲（M2 修复）：部分上游先发 arguments 后发 id/name，甚至完全不发。
+  // 开块需要 id+name 齐备（Anthropic 规范 content_block_start 必须带 id/name），
+  // 所以在拿到 id 或 name 前先把该 tool_index 的增量攒起来，齐了再开块并回放。
+  const pending = new Map(); // index -> { index, id, name, chunks: [partial_json], opened }
   const encoder = new TextEncoder();
   const events = (ctl, name, data) => { if (!data.type) data.type = name; ctl.enqueue(encoder.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`)); };
   const close = (ctl) => { if (block) { events(ctl, "content_block_stop", { index: block.index }); block = null; } };
+  const openPending = (ctl, p) => {
+    if (p.opened) return;
+    p.opened = true;
+    close(ctl);
+    block = { index: ++blockIndex, kind: "tool", sourceIndex: p.index };
+    events(ctl, "content_block_start", { index: block.index, content_block: { type: "tool_use", id: p.id || ("toolu_" + Math.random().toString(36).slice(2, 10)), name: p.name || "", input: {} } });
+    for (const frag of p.chunks) events(ctl, "content_block_delta", { index: block.index, delta: { type: "input_json_delta", partial_json: frag } });
+    pending.delete(p.index);
+  };
+  // 把已满足开块条件（id 或 name 已知）的 pending 工具按 index 顺序打开
+  const flushOpenable = (ctl) => {
+    for (const p of [...pending.values()].sort((a, b) => a.index - b.index)) {
+      if (!p.opened && (p.id || p.name)) openPending(ctl, p);
+    }
+  };
   const end = (ctl) => {
     if (ended) return; ended = true;
     if (!started) events(ctl, "message_start", { message: { id: "msg_" + Math.random().toString(36).slice(2, 10), type: "message", role: "assistant", model: mc.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: input, output_tokens: 0 } } });
+    // 流结束仍未拿到 id/name 的工具增量：兜底打开并回放，避免参数丢失（审计 M2）
+    for (const p of [...pending.values()].sort((a, b) => a.index - b.index)) openPending(ctl, p);
+    pending.clear();
     close(ctl);
     events(ctl, "message_delta", { delta: { stop_reason: reason, stop_sequence: null }, usage: { output_tokens: output } });
     events(ctl, "message_stop", {});
@@ -1987,12 +2135,18 @@ function anthropicStream(mc) {
         if (obj.usage) { input = obj.usage.prompt_tokens ?? input; output = obj.usage.completion_tokens ?? output; }
         const choice = obj.choices?.[0]; if (!choice) continue;
         const delta = choice.delta || {};
+        flushOpenable(ctl);
         if (!started) { started = true; events(ctl, "message_start", { message: { id: "msg_" + Math.random().toString(36).slice(2, 10), type: "message", role: "assistant", model: mc.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: input, output_tokens: 0 } } }); }
         if (Array.isArray(delta.tool_calls)) {
           for (const tc of delta.tool_calls) {
             const fn = tc.function || {}; const idx = tc.index ?? 0;
-            if (!block || block.kind !== "tool" || block.sourceIndex !== idx) { close(ctl); block = { index: ++blockIndex, kind: "tool", sourceIndex: idx }; events(ctl, "content_block_start", { index: block.index, content_block: { type: "tool_use", id: tc.id || ("toolu_" + Math.random().toString(36).slice(2, 10)), name: fn.name || "", input: {} } }); }
-            if (fn.arguments) events(ctl, "content_block_delta", { index: block.index, delta: { type: "input_json_delta", partial_json: fn.arguments } });
+            let p = pending.get(idx);
+            if (!p) { p = { index: idx, id: "", name: "", chunks: [], opened: false }; pending.set(idx, p); }
+            if (tc.id) p.id = tc.id;
+            if (fn.name) p.name = fn.name;
+            if (fn.arguments) p.chunks.push(fn.arguments);
+            // id 或 name 已知即可开块（Anthropic 要求 id；name 兜底合成）
+            if (p.id || p.name) openPending(ctl, p);
           }
         } else if (delta.content) {
           if (!block || block.kind !== "text") { close(ctl); block = { index: ++blockIndex, kind: "text" }; events(ctl, "content_block_start", { index: block.index, content_block: { type: "text", text: "" } }); }
@@ -2006,11 +2160,16 @@ function anthropicStream(mc) {
 }
 
 async function handleAnthropicMessages(request, env) {
-  let body;
-  try { body = await request.json(); } catch { return anthropicError("Invalid JSON", "invalid_request_error", 400); }
+  const { params: body, error } = await readJsonBody(request);
+  if (error) {
+    const msg = error.status === 413 ? "Request body too large" : "Invalid JSON";
+    return anthropicError(msg, "invalid_request_error", error.status === 413 ? 413 : 400);
+  }
   const openaiModel = anthropicModelToOpenAI(body.model);
   const mc = await resolveModelConfig(openaiModel);
   if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
+  const capErr = bodyCapsViolation(body);
+  if (capErr) return anthropicError(capErr, "invalid_request_error", 400);
   const chat = anthropicToChat(body, mc);
   // Anthropic/Claude Code 路径：保留客户端声明的工具名（Bash/Read/Write…），不做 Codex exec 协议改写
   const response = await executeChat(env, chat, mc, !!chat.stream, "chat", { preserveToolNames: true });
@@ -2192,8 +2351,15 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
           await sendObj(finalChunk);
         }
         await writer.write(encoder.encode("data: [DONE]\n\n"));
-      } else if (!sawUpstreamDone) {
-        await writer.write(encoder.encode("data: [DONE]\n\n"));
+      } else {
+        // 非 sanitize 路径流中途错误：必须转发，绝不假装成功完成（审计 2.6）。
+        // sanitize 路径的错误在下方 if(sanitize) 分支处理。
+        if (upstreamError) {
+          await writer.write(encoder.encode("data: " + JSON.stringify({ error: upstreamError }) + "\n\n"));
+        }
+        if (!sawUpstreamDone) {
+          await writer.write(encoder.encode("data: [DONE]\n\n"));
+        }
       }
     } catch (err) {
       // R1：绝不让客户端无声挂起——至少告知错误再关闭
@@ -2216,6 +2382,7 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   let buf = "", content = "", reasoning = "", finishReason = null, model = "", id = "", usage = null;
+  let sawAny = false; // 是否见过任何有效数据（空流 → EmptyUpstreamStreamError）
   const toolCalls = new Map(); // 上游 tool_calls index → {id, type, function:{name, arguments}}
   while (true) {
     const { done, value } = await reader.read();
@@ -2235,9 +2402,10 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
         // usage/model 可能在独立的尾块里到达（choices 为空）：先于 choice 判断收集
         if (obj.id) id = obj.id;
         if (obj.model) model = obj.model;
-        if (obj.usage) usage = obj.usage;
+        if (obj.usage) { usage = obj.usage; sawAny = true; }
         const choice = obj?.choices?.[0];
         if (!choice) continue;
+        sawAny = true;
         const delta = choice.delta || {};
         if (delta.content) content += delta.content;
         if (delta.reasoning_content) reasoning += delta.reasoning_content;
@@ -2266,6 +2434,8 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
       }
     }
   }
+  // 空流（200 但无任何数据）：视为脏 session，交给调用方重建后重试（审计 2.7）
+  if (!sawAny) throw new EmptyUpstreamStreamError();
   const msg = { role: "assistant", content };
   if (toolCalls.size > 0) {
     msg.tool_calls = Array.from(toolCalls.values());
@@ -2510,7 +2680,10 @@ class StreamingXmlFilter {
   constructor() {
     this.state = "NORMAL"; // "NORMAL" | "TAG_READING" | "SUPPRESSED" | "SUPPRESSED_TAG_READING"
     this.tagBuf = "";
-    this.suppressDepth = 0;
+    // F2 修正：名字感知的抑制栈。旧实现只有 suppressDepth 计数，
+    // 不匹配的闭合标签（如顶层悬空的 </invoke>）会让深度偏移，导致后续文本被误吞或标签泄露。
+    // 现在按标签名精确配对：只有真正闭合栈顶同名标签才退栈。
+    this.suppressStack = []; // 栈内是当前处于抑制状态的标签名（小写）
   }
 
   feed(chunk) {
@@ -2530,10 +2703,13 @@ class StreamingXmlFilter {
       } else if (this.state === "TAG_READING") {
         this.tagBuf += ch;
 
-        // Check if literal comparison operator (e.g. "< " or "< 5")
+        // F1 修正：字面比较符检查不能把 "/" 算进去。
+        // 旧实现 /\s|\d|[=+\-*/]/ 把 "</invoke>" 的 "</" 误判成字面 "< " 比较，
+        // 导致闭合标签整体泄露到客户端文本（"answer</invoke>rest" 场景）。
+        // 合法字面比较符：空白、数字、= + - *；"/" 只出现在标签语法里。
         if (this.tagBuf.length === 2) {
           const second = this.tagBuf[1];
-          if (/\s|\d|[=+\-*/]/.test(second)) {
+          if (/\s|\d|[=+\-*]/.test(second)) {
             output += this.tagBuf;
             this.tagBuf = "";
             this.state = "NORMAL";
@@ -2542,25 +2718,30 @@ class StreamingXmlFilter {
         }
 
         if (ch === ">") {
-          const { isSuppressed, isStripOnly, isClosing, isSelfClosing } = this._analyzeTag(this.tagBuf);
+          const { isSuppressed, isStripOnly, isClosing, isSelfClosing, tagName } = this._analyzeTag(this.tagBuf);
 
           if (isStripOnly) {
-            if (this.suppressDepth === 0) this.state = "NORMAL";
+            // attempt_completion/result：剥掉标签本身，内容可见
+            if (this.suppressStack.length === 0) this.state = "NORMAL";
             else this.state = "SUPPRESSED";
           } else if (isSuppressed) {
             if (isClosing) {
-              if (this.suppressDepth > 0) this.suppressDepth--;
-              if (this.suppressDepth === 0) this.state = "NORMAL";
+              // 仅当闭合的是栈顶同名标签才退栈（F2：不匹配的闭合不改变状态）
+              if (this.suppressStack.length > 0 && this.suppressStack[this.suppressStack.length - 1] === tagName) {
+                this.suppressStack.pop();
+              }
+              if (this.suppressStack.length === 0) this.state = "NORMAL";
               else this.state = "SUPPRESSED";
             } else if (isSelfClosing) {
-              if (this.suppressDepth === 0) this.state = "NORMAL";
+              if (this.suppressStack.length === 0) this.state = "NORMAL";
               else this.state = "SUPPRESSED";
             } else {
-              this.suppressDepth++;
+              this.suppressStack.push(tagName);
               this.state = "SUPPRESSED";
             }
           } else {
-            if (this.suppressDepth === 0) {
+            // 非抑制标签：在抑制区内直接丢弃，区外原样保留
+            if (this.suppressStack.length === 0) {
               output += this.tagBuf;
               this.state = "NORMAL";
             } else {
@@ -2582,17 +2763,20 @@ class StreamingXmlFilter {
         this.tagBuf += ch;
 
         if (ch === ">") {
-          const { isSuppressed, isStripOnly, isClosing, isSelfClosing } = this._analyzeTag(this.tagBuf);
+          const { isSuppressed, isStripOnly, isClosing, isSelfClosing, tagName } = this._analyzeTag(this.tagBuf);
 
           if (isSuppressed && !isStripOnly) {
             if (isClosing) {
-              if (this.suppressDepth > 0) this.suppressDepth--;
+              // 名字感知退栈（同上）
+              if (this.suppressStack.length > 0 && this.suppressStack[this.suppressStack.length - 1] === tagName) {
+                this.suppressStack.pop();
+              }
             } else if (!isSelfClosing) {
-              this.suppressDepth++;
+              this.suppressStack.push(tagName);
             }
           }
 
-          if (this.suppressDepth === 0) {
+          if (this.suppressStack.length === 0) {
             this.state = "NORMAL";
           } else {
             this.state = "SUPPRESSED";
@@ -2600,7 +2784,7 @@ class StreamingXmlFilter {
           this.tagBuf = "";
         } else if (this.tagBuf.length > 500) {
           this.tagBuf = "";
-          if (this.suppressDepth === 0) this.state = "NORMAL";
+          if (this.suppressStack.length === 0) this.state = "NORMAL";
           else this.state = "SUPPRESSED";
         }
       }
@@ -2613,14 +2797,14 @@ class StreamingXmlFilter {
     let output = "";
     if (this.state === "TAG_READING" && this.tagBuf) {
       const cleanTag = this.tagBuf.replace(/[^\w\s<>]/g, "");
-      const isLikelySuppressed = Array.from(SUPPRESSED_TAG_NAMES).some(tag => cleanTag.toLowerCase().includes(tag));
-      if (!isLikelySuppressed && this.suppressDepth === 0) {
+      const isLikelySuppressed = Array.from(SUPPRESSED_TAG_NAMES).some((tag) => cleanTag.toLowerCase().includes(tag));
+      if (!isLikelySuppressed && this.suppressStack.length === 0) {
         output += this.tagBuf;
       }
     }
     this.tagBuf = "";
     this.state = "NORMAL";
-    this.suppressDepth = 0;
+    this.suppressStack = [];
     return output;
   }
 
@@ -2842,6 +3026,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
   const send = (obj) => writer.write(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
 
   let contentItem = null;
+  let reasoningItem = null; // 推理 item（M4：推理用规范 reasoning item + summary_text 事件）
   let rawTextAccumulator = "";
   const xmlFilter = dsmlPassthrough ? null : new StreamingXmlFilter();
   const nativeToolItems = new Map(); // 上游原生 tool_calls index → {id, callId, name, args, outputIndex, started}
@@ -2919,9 +3104,20 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
               }
             }
 
-            // 推理增量：透传 reasoning_summary，Codex GUI 不再空白等待
+            // 推理增量：用规范 reasoning item 透传（Codex GUI 不再空白等待）。
+            // 事件名必须用 response.reasoning_summary_text.delta（M4 修正：
+            // 旧的 response.reasoning_summary.delta 不是公开规范事件名）。
             if (delta.reasoning_content) {
-              await send({ type: "response.reasoning_summary.delta", item_id: contentItem?.id || "", output_index: contentItem?.outputIndex ?? 0, delta: delta.reasoning_content });
+              if (!reasoningItem) {
+                reasoningItem = { kind: "reasoning", id: "rs_" + Math.random().toString(36).slice(2, 10), outputIndex: nextOutputIndex++, text: "", started: false };
+              }
+              if (!reasoningItem.started) {
+                reasoningItem.started = true;
+                await send({ type: "response.output_item.added", output_index: reasoningItem.outputIndex, item: { id: reasoningItem.id, type: "reasoning", status: "in_progress", summary: [] } });
+                await send({ type: "response.content_part.added", item_id: reasoningItem.id, output_index: reasoningItem.outputIndex, content_index: 0, part: { type: "summary_text", text: "" } });
+              }
+              reasoningItem.text += delta.reasoning_content;
+              await send({ type: "response.reasoning_summary_text.delta", item_id: reasoningItem.id, output_index: reasoningItem.outputIndex, content_index: 0, delta: delta.reasoning_content });
             }
 
             // 文本增量：实时过滤 DSML / commentary / tool_calls / attempt_completion 标签，绝不把 XML 泄露给客户端
@@ -2989,6 +3185,9 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         };
         finalItems.push(msgItem);
       }
+
+      // 推理 item 也进入输出顺序（已按 outputIndex 排序，位置不影响）
+      if (reasoningItem) finalItems.push(reasoningItem);
 
       for (const item of nativeToolItems.values()) {
         if (item?.dropped) continue; // 已丢弃的未知工具
@@ -3069,6 +3268,16 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
           await send({ type: "response.output_text.done", item_id: item.id, output_index: item.outputIndex, content_index: 0, text: item.text });
           await send({ type: "response.content_part.done", item_id: item.id, output_index: item.outputIndex, content_index: 0, part });
           await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "completed", role: "assistant", content: [part] } });
+        } else if (item.kind === "reasoning") {
+          // 推理 item 收尾：done 事件必须带上已累计的完整文本（M4）
+          const text = item.text || "";
+          if (!item.started) {
+            await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "reasoning", status: "in_progress", summary: [] } });
+            await send({ type: "response.content_part.added", item_id: item.id, output_index: item.outputIndex, content_index: 0, part: { type: "summary_text", text: "" } });
+          }
+          await send({ type: "response.reasoning_summary_text.done", item_id: item.id, output_index: item.outputIndex, content_index: 0, text });
+          await send({ type: "response.content_part.done", item_id: item.id, output_index: item.outputIndex, content_index: 0, part: { type: "summary_text", text } });
+          await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "reasoning", status: "completed", summary: [{ type: "summary_text", text }] } });
         } else {
           const isCustom = item.name === "exec";
           if (!item.started) {
@@ -3096,6 +3305,9 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       resp.output = keptItems.map((item) => {
         if (item.kind === "message") {
           return { id: item.id, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: item.text, annotations: [] }] };
+        }
+        if (item.kind === "reasoning") {
+          return { id: item.id, type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: item.text || "" }] };
         }
         if (item.name === "exec") {
           return { id: item.id, type: "custom_tool_call", status: "completed", call_id: item.callId, name: item.name, input: item.args };
@@ -3127,6 +3339,7 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   let buf = "", model = "", outputText = "", reasoning = "", usage = null;
+  let sawAny = false; // 空流检测（审计 2.7）
   const toolItems = new Map(); // 上游 tool_calls index → {id, callId, name, args}
   while (true) {
     const { done, value } = await reader.read();
@@ -3144,9 +3357,10 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
           throw new Error("Upstream error: " + String(obj.error?.message || JSON.stringify(obj.error)).slice(0, 500));
         }
         if (obj.model) model = obj.model;
-        if (obj.usage) usage = obj.usage;
+        if (obj.usage) { usage = obj.usage; sawAny = true; }
         const choice = obj?.choices?.[0];
         if (!choice) continue;
+        sawAny = true;
         const delta = choice.delta || {};
         if (delta.content) outputText += delta.content;
         if (delta.reasoning_content) reasoning += delta.reasoning_content;
@@ -3175,6 +3389,8 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
       }
     }
   }
+  // 空流（200 但无任何数据）：视为脏 session（审计 2.7）
+  if (!sawAny) throw new EmptyUpstreamStreamError();
   const resp = responsesBase(mc, undefined, Math.floor(Date.now() / 1000), requestParams);
   resp.status = "completed";
   resp.model = model || mc.id;
@@ -3195,6 +3411,10 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
   const raw = outputText || reasoning || "";
   const parsed = dsmlPassthrough ? { cleanedText: raw, toolCalls: [], commentary: "" } : parseXmlToolCallsAndCommentary(raw, clientTools);
   const text = dsmlPassthrough ? parsed.cleanedText : (parsed.cleanedText || parsed.commentary);
+  // 非流式：推理内容也作为 reasoning item 输出（M4 修正，与流式语义一致）
+  if (reasoning) {
+    resp.output.push({ id: "rs_" + Math.random().toString(36).slice(2, 10), type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: reasoning }] });
+  }
   if (text) {
     resp.output.push({
       id: "msg_" + Math.random().toString(36).slice(2, 10),
@@ -3240,20 +3460,30 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
 // 工具
 // ---------------------------------------------------------------------------
 
-// 轻量缓存清理：避免长时间运行后 Map 无限膨胀（Workers 无自动 GC）
+// 轻量缓存清理：避免长时间运行后 Map 无限膨胀（Workers 无自动 GC）。
+// 修正：cooldowns/behaviorCache/acctHealth 之前完全不会过期清理，
+// 旧 cooldown 会永久钉住账号（审计 R4）。
 function cleanCache() {
   const now = Date.now();
   try {
-    if (sessCache.size > 50) {
-      for (const [k, v] of sessCache) {
-        const exp = v.expiresAt ? new Date(v.expiresAt).getTime() : 0;
-        if (exp > 0 && exp < now) sessCache.delete(k);
-      }
+    for (const [k, v] of sessCache) {
+      const exp = v.expiresAt ? new Date(v.expiresAt).getTime() : 0;
+      if (exp > 0 && exp < now) sessCache.delete(k);
     }
-    if (runCache.size > 50) {
-      for (const [k, v] of runCache) {
-        if (now - v.ts > RUN_CACHE_TTL_MS) runCache.delete(k);
-      }
+    for (const [k, v] of runCache) {
+      if (now - v.ts > RUN_CACHE_TTL_MS) runCache.delete(k);
+    }
+    // 冷却表：过期即清（永不过期的冷却会把账号钉死）
+    for (const [t, until] of cooldowns) {
+      if (until <= now) cooldowns.delete(t);
+    }
+    // 行为节流表（ads/usage）：超 TTL 即清
+    for (const [k, ts] of behaviorCache) {
+      if (now - ts > BEHAVIOR_CACHE_TTL_MS) behaviorCache.delete(k);
+    }
+    // 账号健康观察：超观察 TTL 即清（下次请求重新探测）
+    for (const [t, h] of acctHealth) {
+      if (now - h.checkedAt > HEALTH_OBSERVATION_TTL_MS) acctHealth.delete(t);
     }
   } catch {}
 }
@@ -3277,11 +3507,13 @@ async function handleModels() {
 }
 
 function getApiKey(request, env) {
-  // 未配置 API key → 拒绝所有请求（不允许默认密钥后门）；配置后要求精确匹配
-  const configured = (env.API_KEY || env.FREEBUFF_API_KEY || "").trim();
+  // 未配置 API key → 拒绝所有请求（不允许默认密钥后门）；配置后要求精确匹配。
+  // 仅认 FREEBUFF_API_KEY（历史遗留的 API_KEY 别名已移除，避免未文档化的后门路径）。
+  const configured = (env.FREEBUFF_API_KEY || "").trim();
   const auth = request.headers.get("Authorization") || "";
   const xKey = request.headers.get("x-api-key") || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : xKey.trim();
+  const bearer = /^bearer\s+/i.test(auth) ? auth.slice(7).trim() : "";
+  const token = bearer || xKey.trim();
   if (!token || !configured) return null;
   if (token === configured) return token;
   return null;

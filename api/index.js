@@ -1,11 +1,15 @@
 import worker from '../worker.js';
+import { loadDotEnv } from '../load-env.mjs';
+
+loadDotEnv();
 
 export default async function handler(req, res) {
   const handlerFunc = worker.default ? worker.default.fetch : worker.fetch;
 
   const env = {
     FREEBUFF_TOKEN: process.env.FREEBUFF_TOKEN || '',
-    FREEBUFF_API_KEY: process.env.FREEBUFF_API_KEY || 'freebuff-default-key',
+    // 不设默认密钥：未配置时所有请求 fail-closed（worker.getApiKey 返回 null → 401）。
+    FREEBUFF_API_KEY: (process.env.FREEBUFF_API_KEY || '').trim(),
     FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
     CODEBUFF_API: process.env.CODEBUFF_API || '',
     RELAY_KEY: process.env.RELAY_KEY || '',

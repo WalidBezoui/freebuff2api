@@ -575,7 +575,7 @@ async function readRawSSE(res) {
   check("T21 no XML leak", !JSON.stringify(events).includes("<"), "");
 }
 
-// ---------- T22: 非流式 responses 空输出 → " " 兜底（Codex 拒绝空 output） ----------
+// ---------- T22: 非流式 responses 空流 → 502 错误（审计 2.7：不再假装空成功） ----------
 {
   currentStream = [];
   upstreamChatBodies = [];
@@ -585,8 +585,7 @@ async function readRawSSE(res) {
   });
   const res = await worker.fetch(req, ENV);
   const json = await res.json();
-  check("T22 empty stream still completed", res.status === 200 && json?.status === "completed", res.status + " " + json?.status);
-  check("T22 output non-empty fallback", Array.isArray(json?.output) && json.output.length === 1 && json.output[0].content?.[0]?.text === " ", JSON.stringify(json?.output));
+  check("T22 empty stream rejected", res.status === 502 && json?.error?.message, res.status + " " + JSON.stringify(json?.error));
 }
 
 // ---------- T23: 相同 (name,args) 的两个并行 native 调用都保留（live-added 项不可去重移除） ----------
@@ -765,14 +764,20 @@ async function readRawSSE(res) {
   check("T30 correct key -> 200", resOk.status === 200, "status=" + resOk.status);
 }
 
-// ---------- T31: reasoning_content → response.reasoning_summary.delta ----------
+// ---------- T31: reasoning_content → 规范 reasoning item（M4：response.reasoning_summary_text.delta） ----------
 {
   const events = await responsesStreamTest([
     chunk({ role: "assistant", content: "Let me think", reasoning_content: "analyzing the request..." }),
     { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
   ]);
-  const reasoningDeltas = events.filter((e) => e.type === "response.reasoning_summary.delta");
-  check("T31 reasoning_summary.delta emitted", reasoningDeltas.some((e) => String(e.delta).includes("analyzing")), JSON.stringify(reasoningDeltas));
+  const reasoningDeltas = events.filter((e) => e.type === "response.reasoning_summary_text.delta");
+  check("T31 reasoning_summary_text.delta emitted", reasoningDeltas.some((e) => String(e.delta).includes("analyzing")), JSON.stringify(reasoningDeltas));
+  const reasoningAdded = events.filter((e) => e.type === "response.output_item.added" && e.item?.type === "reasoning");
+  check("T31 reasoning item added", reasoningAdded.length === 1 && Array.isArray(reasoningAdded[0].item?.summary), JSON.stringify(reasoningAdded));
+  const reasoningDone = events.filter((e) => e.type === "response.output_item.done" && e.item?.type === "reasoning");
+  check("T31 reasoning item done with text", reasoningDone.length === 1 && reasoningDone[0].item?.summary?.[0]?.text?.includes("analyzing"), JSON.stringify(reasoningDone));
+  const completed = events.find((e) => e.type === "response.completed");
+  check("T31 reasoning in completed output", completed?.response?.output?.some((o) => o.type === "reasoning" && o.summary?.[0]?.text?.includes("analyzing")), JSON.stringify(completed?.response?.output));
 }
 
 // ---------- T32: responsesBase 回显原请求参数 ----------
@@ -850,6 +855,103 @@ async function readRawSSE(res) {
   const res = await worker.fetch(req, ENV);
   await readRawSSE(res);
   check("T36 explicit effort max passthrough", upstreamChatBodies[0]?.body?.reasoning_effort === "max", JSON.stringify(upstreamChatBodies[0]?.body?.reasoning_effort));
+}
+
+// ---------- T37: anthropic tool_result 内容拍平为字符串（OpenAI tool 消息 content 必须为 string） ----------
+{
+  currentStream = [{ id: "cmpl-37", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { role: "assistant", content: "done" }, finish_reason: "stop" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer freebuff-default-key", "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: MODEL, stream: true, max_tokens: 100,
+      messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "tu_1", content: [{ type: "text", text: "ls ok" }] }] }],
+    }),
+  });
+  const res = await worker.fetch(req, ENV);
+  await readRawSSE(res);
+  const toolMsg = upstreamChatBodies[0]?.body?.messages?.find((m) => m.role === "tool");
+  check("T37 tool message content is string", typeof toolMsg?.content === "string" && toolMsg.content === "ls ok", JSON.stringify(toolMsg));
+  check("T37 tool_call_id preserved", toolMsg?.tool_call_id === "tu_1", JSON.stringify(toolMsg?.tool_call_id));
+}
+
+// ---------- T38: 非 sanitize 流中途上游错误必须转发（不得假装成功 [DONE]） ----------
+{
+  currentStream = [
+    { id: "cmpl-38", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { role: "assistant", content: "partial" }, finish_reason: null }] },
+    { error: { message: "mid-stream boom", type: "api_error" } },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/chat/completions", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, stream: true, tools: [{ type: "function", function: { name: "web_search" } }], messages: [{ role: "user", content: "hi" }] }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const raw = await readRawSSE(res);
+  const errorEvt = raw.find((e) => e && typeof e === "object" && e.error);
+  check("T38 non-sanitize error forwarded", !!errorEvt && String(errorEvt.error?.message).includes("boom"), JSON.stringify(raw).slice(0, 300));
+  const doneIdx = raw.indexOf("[DONE]");
+  const errIdx = raw.indexOf(errorEvt);
+  check("T38 error before [DONE]", errIdx >= 0 && doneIdx >= 0 && errIdx < doneIdx, "err=" + errIdx + " done=" + doneIdx);
+}
+
+// ---------- T39: anthropic 流 M2 修复——工具增量在 id/name 到达前缓冲，多工具交错不乱序 ----------
+{
+  currentStream = [
+    chunk({ tool_calls: [{ index: 0, function: { arguments: "{\"cm" } }] }),
+    chunk({ tool_calls: [{ index: 1, function: { arguments: "{\"pa" } }] }),
+    chunk({ tool_calls: [{ index: 0, id: "call_x", function: { name: "exec_command", arguments: "d\": \"dir\"}" } }] }),
+    chunk({ tool_calls: [{ index: 1, id: "call_y", function: { name: "exec_command", arguments: "th\": \".\"}" } }] }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer freebuff-default-key", "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model: MODEL, stream: true, max_tokens: 100, tools: [{ name: "web_search", input_schema: { type: "object", properties: {} } }], messages: [{ role: "user", content: "hi" }] }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const raw = await readRawSSE(res);
+  const starts = raw.filter((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use");
+  check("T39 both tool blocks opened", starts.length === 2, JSON.stringify(starts));
+  check("T39 real id used (no synthesized)", starts[0]?.content_block?.id === "call_x" && starts[1]?.content_block?.id === "call_y" && !JSON.stringify(starts).includes("toolu_"), JSON.stringify(starts.map((s) => s.content_block?.id)));
+  const argsByBlock = {};
+  for (const e of raw.filter((e2) => e2.type === "content_block_delta" && e2.delta?.type === "input_json_delta")) {
+    argsByBlock[e.index] = (argsByBlock[e.index] || "") + e.delta.partial_json;
+  }
+  check("T39 args reassembled in order", argsByBlock[0] === "{\"cmd\": \"dir\"}" && argsByBlock[1] === "{\"path\": \".\"}", JSON.stringify(argsByBlock));
+  check("T39 message_stop present", raw.some((e) => e.type === "message_stop"), "");
+}
+
+// ---------- T40: StreamingXmlFilter F1/F2 回归（拆分块 + 不匹配闭合标签） ----------
+{
+  const cases = [
+    ["F1 closing leak", "<attempt_completion><result>42 files</result></attempt_completion>", "42 files"],
+    ["F1 stray invoke close", "answer</invoke>rest", "answerrest"],
+    ["F1 chunk-split closing part1", "<attempt_completion><result>hi", "hi"],
+    ["F2 mismatched close", "pre<invoke><parameter name=\"cmd\">x</invoke>post", "pre"],
+    ["F2 nested proper", "a<invoke><parameter name=\"cmd\">x</parameter></invoke>b", "ab"],
+    ["F2 self-closing", "a<invoke/>b", "ab"],
+    ["F2 unclosed at end", "a<invoke><parameter name=\"cmd\">x", "a"],
+  ];
+  for (const [name, input, expect] of cases) {
+    currentStream = [];
+    upstreamChatBodies = [];
+    const req = new Request("https://localhost/v1/chat/completions", {
+      method: "POST", headers: AUTH,
+      body: JSON.stringify({ model: MODEL, stream: false, messages: [{ role: "user", content: "hi" }] }),
+    });
+    // 走 sanitize=true 路径（无工具）验证最终文本
+    // 通过上游直接吐该文本（XML 会被 worker 过滤）
+    const chunks = [];
+    for (let i = 0; i < input.length; i++) chunks.push(chunk({ role: "assistant", content: input[i] }));
+    currentStream = [...chunks, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }];
+    const res2 = await worker.fetch(req, ENV);
+    const json = await res2.json();
+    const msgText = json?.choices?.[0]?.message?.content || "";
+    check("T40 " + name + " -> " + JSON.stringify(expect), msgText === expect, JSON.stringify(msgText));
+  }
 }
 
 const failed = results.filter((r) => !r.ok);

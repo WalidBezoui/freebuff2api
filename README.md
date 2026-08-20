@@ -63,7 +63,7 @@ Worker 通过 Cloudflare Workers 访问 Freebuff，上游通常会将请求识�
 2. 部署服务（见下方「部署」，**推荐 Docker 容器部署**）
 3. 配置环境变量：
    - `FREEBUFF_TOKEN`（必需）= 你的 token
-   - `FREEBUFF_API_KEY`（可选）= 自定义访问 key，缺省 `freebuff-default-key`
+   - `FREEBUFF_API_KEY`（**必填**）= 访问 key；未配置时所有请求返回 401（v1.9.2 起不设默认密钥后门）
 4. 用任意 OpenAI 客户端连接：
    - **Base URL**: `http://localhost:8877/v1`（Docker 部署）或 `https://你的worker名.你的子域.workers.dev/v1`（CF 部署，不推荐）
    - **API Key**: `<FREEBUFF_API_KEY 的值>`
@@ -76,7 +76,7 @@ Worker 通过 Cloudflare Workers 访问 Freebuff，上游通常会将请求识�
 
 ```bash
 curl https://你的worker.workers.dev/healthz
-# {"status":"ok","version":"1.4.0","time":"..."}
+# {"status":"ok","version":"1.9.2","time":"...","account_details":"..."}
 ```
 
 - `version` 字段=当前部署的版本号，**每次部署版本号都会变化**，用于确认线上是否已更新（CF 边缘缓存有延迟，验证时等几秒或加随机参数）
@@ -162,7 +162,7 @@ docker compose up -d --build
 | 变量 | 说明 |
 |---|---|
 | `PORT` / `HOST` | 监听端口/地址，默认 `8787` / `0.0.0.0` |
-| `FREEBUFF_API_KEY` | 本 API 访问 key。**必填**：未配置时所有请求返回 401（不设默认密钥后门）；本地开发默认 `freebuff-default-key` |
+| `FREEBUFF_API_KEY` | 本 API 访问 key。**必填**：未配置时所有请求返回 401（不设默认密钥后门） |
 | `FREEBUFF_DEBUG` | `true` 开启请求级调试日志 |
 
 > ⚠️ 容器内 `credentials/` 以只读方式挂载；`server.js` 启动时读取并组装 `FREEBUFF_TOKEN`（多账号逗号分隔）。
@@ -307,7 +307,7 @@ curl -N https://你的worker.workers.dev/v1/chat/completions \
 
 `FREEBUFF_TOKEN` 用英文逗号分隔多个 token（`token1,token2`）。撞额度（429/空响应）时自动冷却当前账号并切下一个。
 
-**账号选择策略**（v1.4.0 起）：
+**账号选择策略**（当前版本）：
 
 1. 优先复用**已有活跃 session 缓存**的账号——session 约 1 小时有效，创建才扣额度，复用不扣；
 2. 没有活跃缓存时才轮询下一个账号。

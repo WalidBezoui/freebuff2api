@@ -1,0 +1,13 @@
+node_modules/
+.env
+.env.*
+!.env.example
+credentials/
+freebuff_tools/freebuff_credentials.json
+**/freebuff_credentials.json
+test/
+logs/
+scratch/
+.git
+CHANGELOG.md
+*.py

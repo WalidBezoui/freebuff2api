@@ -4,14 +4,26 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Run unit + replay suites
+      - name: Assert committed fixtures parse (fail fast, avoid silent scratch fallback)
+        run: node scripts/check-fixtures.mjs
+      - name: Run unit + replay + security suites (offline, no upstream quota)
         run: npm test
+        env:
+          # 显式禁止任何 live 上游测试：CI 只能跑离线 mock 套件。
+          # 缺少该变量时 test-live.mjs 必须拒绝执行（见 scripts/test-live.mjs 的 ALLOW_LIVE 守卫）。
+          ALLOW_LIVE: "0"

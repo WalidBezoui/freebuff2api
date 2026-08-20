@@ -14,27 +14,30 @@ This document contains critical architectural context, upstream quota constraint
 - The proxy caches active sessions in `sessCache` (`${token}:${sessionModel}`) to reuse them across turns.
 
 ### Upstream Quotas & Limits
-1. **Account Creation Quota**: Free-tier Codebuff accounts have a base entitlement of **1 new session creation per 24 hours** (Pacific Day, resets at `00:00 Pacific Time` / `07:00 UTC`).
-2. **US IP vs. Account Tier**:
+1. **Session Creation Quota**: Free-tier Codebuff accounts get a base entitlement of **6 new session creations per Pacific day** (README §额度; resets at `00:00 Pacific Time` / `07:00 UTC` / 北京 15:00). A single burst limiter additionally caps rapid creation (`429 Rate Limited (recentCount: 1.2 > limit: 1)`) — do not fire several `POST /session` in a row.
+2. **Quota Debits on Creation**: quota is consumed per **session creation**, not per turn — one session is valid ~1 hour and supports unlimited turns inside it. Reuse cached sessions (`sessCache`) to avoid burning daily creation quota.
+3. **US IP vs. Account Tier**:
    - The US egress IP (via Vercel in Washington D.C.) bypasses the geographic block (`country_not_allowed`).
-   - The US IP does **not** grant paid Pro status to free accounts. The 1-session/day creation rule still applies to free accounts.
-3. **Multi-Account Pooling**:
+   - The US IP does **not** grant paid Pro status to free accounts; the daily creation quota still applies.
+4. **Multi-Account Pooling**:
    - The proxy supports pooling multiple accounts via `FREEBUFF_TOKEN` (comma- or newline-separated).
-   - `worker.js` automatically rotates and load-balances across available tokens.
+   - `worker.js` automatically rotates and load-balances across available tokens, and cooldowns/quarantines exhausted accounts.
+5. **Upstream Override**: set `CODEBUFF_API` env to point all upstream calls at a relay instead of the default `https://www.codebuff.com` (resolved per-request in `fetch()`).
 
 ---
 
 ## 2. Testing Guidelines for AI Agents (CRITICAL)
 
 ### Rule 1: Always Run Offline Mock Tests (`npm test`)
-- Run `npm test` (`scripts/test-tools.mjs` + `scripts/test-codex-replay.mjs`).
-- `npm test` runs **131 tests completely offline** against local mock fixtures in <2 seconds.
-- It tests tool parsing, DSML extraction, V8 isolate wrapping, error propagation, Claude Code compatibility, and auth without consuming any upstream quota.
+- Run `npm test` (`node --check worker.js` + `scripts/test-tools.mjs` + `scripts/test-codex-replay.mjs` + `scripts/test-security.mjs` + fixture pre-check).
+- `npm test` runs **200+ tests completely offline** against local mock fixtures in a few seconds. Count grows as tests are added — never treat the number as fixed; run the suite, don't count it.
+- It tests tool parsing, DSML extraction, V8 isolate wrapping, error propagation, Claude Code compatibility, all 11 committed Codex capture fixtures, auth fail-closed, input caps, and body/healthz scrubbing without consuming any upstream quota.
 
 ### Rule 2: DO NOT Spam `npm run test:live` / `scripts/test-live.mjs`
 - `scripts/test-live.mjs` tests multiple different models in rapid succession against the live upstream.
 - Firing multiple `POST /session` creation calls in seconds burns the daily session creation quota on active accounts and triggers `429 Rate Limited (recentCount: 1.2 > limit: 1)`.
 - Only run live tests when explicitly requested by the user, and prefer single-command smoke tests with `deepseek/deepseek-v4-flash`.
+- `test-live.mjs` refuses to run unless `ALLOW_LIVE=1` **and** `FREEBUFF_API_KEY` are set (CI sets `ALLOW_LIVE=0`, so CI can never hit the live upstream).
 
 ---
 
@@ -56,4 +59,16 @@ This document contains critical architectural context, upstream quota constraint
    - Do not re-introduce fallback default key backdoors that accept unauthenticated requests.
 5. **Streaming Ordering & Error Handling**:
    - `[DONE]` must always be emitted **last** after all synthesized tool calls, finish reasons, and usage metrics.
-   - Mid-stream upstream errors must emit `response.failed` and an error chunk, never faking a successful `completed` response.
+   - Mid-stream upstream errors must emit `response.failed` and an error chunk, never faking a successful `completed` response. This also applies to the **non-sanitize** chat path (error chunk must precede `[DONE]`).
+6. **Input Caps (`readJsonBody`/`bodyCapsViolation`)**:
+   - Body ≤1MiB (else `413`), messages/input ≤256, tools ≤32, image payload ≤5MiB (else `400`).
+   - Unknown models return `400 unsupported_model` — never silently fall back to `DEFAULT_MODEL`.
+7. **Session Hygiene**:
+   - `createSession` dedups in-flight creations per isolate (`pendingSessions`); never DELETE another model's active session on GET-reuse (supersede naturally instead).
+   - Session recovery (empty stream / stale 428-409-502) must also invalidate `runCache` — run_id is bound to the session.
+   - Non-stream empty 200 responses throw `EmptyUpstreamStreamError` → same-model session recreate + one retry (never a fake empty success).
+8. **StreamingXmlFilter (F1/F2)**:
+   - F1: literal-comparison char class must **not** include `/` (`/\s|\d|[=+\-*]/`), else `</tag>` leaks as text.
+   - F2: suppression is a **name-aware stack** (`suppressStack`), not a depth counter — mismatched closing tags must not shift state.
+9. **Responses Reasoning (`reasoning_item`)**:
+   - Reasoning is a real `reasoning` output item; the spec event is `response.reasoning_summary_text.delta` (not `response.reasoning_summary.delta`), with `output_item.added`/`content_part.added` before it and `.done`/`content_part.done`/`output_item.done` at the end.

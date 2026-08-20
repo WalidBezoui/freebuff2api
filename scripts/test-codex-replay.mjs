@@ -107,8 +107,10 @@ const loadCapture = (name) => {
   ];
   for (const p of candidates) {
     try {
-      const w = JSON.parse(readFileSync(p, "utf8"));
-      return { url: w.url, body: JSON.parse(w.bodyRaw) };
+      // 兼容带 BOM 的旧提交（某些编辑器保存时加 BOM 会让 JSON.parse 直接抛错）
+      const outer = readFileSync(p, "utf8").replace(/^\uFEFF/, "");
+      const w = JSON.parse(outer);
+      return { url: w.url, body: JSON.parse(String(w.bodyRaw).replace(/^\uFEFF/, "")) };
     } catch {}
   }
   console.error("无法读取真实抓包 " + candidates[0].pathname + "（需先通过 scratch/capture-proxy.mjs 抓取 Codex 请求）");
@@ -119,10 +121,10 @@ const turn1 = loadCapture("002");
 const turn2 = loadCapture("003");
 const textOf = (cmd) => `text(await tools.exec_command({ cmd: ${JSON.stringify(cmd)} }));`;
 
-async function replay(body, streamChunks) {
+async function replay(body, streamChunks, url = turn1.url) {
   currentStream = streamChunks;
   upstreamChatBodies = [];
-  const req = new Request("https://localhost" + turn1.url, {
+  const req = new Request("https://localhost" + url, {
     method: "POST", headers: AUTH,
     body: JSON.stringify({ ...body, model: MODEL }),
   });
@@ -287,6 +289,20 @@ const r3 = await replay(turn2.body, [
   let args = {};
   try { args = JSON.parse(fn?.arguments || "{}"); } catch {}
   check("R8 legacy input cmd extracted", args.cmd === "npm test", JSON.stringify(args));
+}
+
+// ---------- R9-R19: 回放全部已提交的真实抓包（004-012）----------
+// 每个 fixture 走完整 worker 管道：断言 200、无 XML/DSML 泄露、上游收到翻译后的 chat 请求。
+// 这些抓包来自不同 Codex 会话形态（multi-turn、并行工具、image 等），逐个回归防止漂移。
+for (const name of ["004", "005", "006", "007", "008", "009", "010", "011", "012"]) {
+  const cap = loadCapture(name);
+  const { status, events, upstream } = await replay(cap.body, nativeExecStream("echo fixture-" + name), cap.url);
+  const tag = "R" + name;
+  check(tag + " status 200", status === 200, "status=" + status);
+  check(tag + " no XML/DSML leak", !JSON.stringify(events).includes("DSML") && !JSON.stringify(events).includes("</"), "");
+  check(tag + " upstream chat translation produced", !!upstream && Array.isArray(upstream.messages) && upstream.messages.length > 0, JSON.stringify(upstream?.messages?.length));
+  check(tag + " exec_command tool injected", Array.isArray(upstream?.tools) && upstream.tools.some((t) => t.function?.name === "exec_command"), JSON.stringify(upstream?.tools?.map((t) => t.function?.name)));
+  check(tag + " response completed or tool_calls", events.some((e) => e.type === "response.completed" || (e.type === "response.output_item.added" && e.item.type === "custom_tool_call")), "");
 }
 
 const passed = results.filter((r) => r.ok).length;

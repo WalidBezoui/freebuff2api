@@ -1,11 +1,27 @@
 /**
  * LIVE end-to-end tests against the deployed proxy (real Codebuff upstream, no mocks).
  * Uses deepseek/deepseek-v4-flash (unlimited quota).
- * Run: node scripts/test-live.mjs [base_url]
+ *
+ *  ⚠️ 安全阀：这是唯一的 live 测试脚本，会真实消耗上游配额（session 创建/失败探测）。
+ *   - 每个账号每天 session 创建额度有限（1/24h 基础额度），连续运行会触发 429。
+ *   - 必须显式设置 ALLOW_LIVE=1 才会执行；CI 中该变量恒为 0，禁止在 CI 触发 live 请求。
+ *   - 手动运行时：只在额度重置后运行一次，一次跑完即停，严禁反复跑。
+ *
+ * Run: ALLOW_LIVE=1 node scripts/test-live.mjs [base_url]
  */
+if (process.env.ALLOW_LIVE !== "1") {
+  console.error("REFUSED: ALLOW_LIVE is not '1'. Live tests consume upstream quota and must be run explicitly after quota reset (07:00 UTC).");
+  process.exit(2);
+}
+
 const BASE = process.argv[2] || "https://freebuff2api-walid-bezouis-projects-fc73dfba.vercel.app/v1";
 const MODEL = "deepseek/deepseek-v4-flash";
-const KEY = "freebuff-default-key";
+// 真实部署已移除默认密钥后门（v1.9.2）：live 测试必须提供真实 FREEBUFF_API_KEY
+const KEY = process.env.FREEBUFF_API_KEY || "";
+if (!KEY) {
+  console.error("REFUSED: FREEBUFF_API_KEY env is required for live tests (v1.9.2+ fail-closed without it).");
+  process.exit(2);
+}
 const H = { "Content-Type": "application/json", Authorization: "Bearer " + KEY };
 
 const execTool = {

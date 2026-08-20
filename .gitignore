@@ -32,6 +32,7 @@ wrangler.toml
 # ⚠️ .env 及所有带真实变量值的文件，绝不提交
 .env
 .env.*
+!.env.example
 
 # 本地日志分析文件，绝不提交
 logs/
