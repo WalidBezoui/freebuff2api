@@ -2,7 +2,7 @@ const CODEBUFF_API = "https://www.codebuff.com";
 // 可被 env.CODEBUFF_API 覆盖的中继地址（fetch 入口每次请求时同步；默认直连官方）
 let activeCodebuffApi = CODEBUFF_API;
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
-const VERSION = "1.9.4";
+const VERSION = "1.9.5";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 输入保护（安全加固）：限制畸形/超大请求，防止不必要地消耗上游额度
@@ -416,9 +416,11 @@ export default {
       // 健康检查只读 Worker 最近一次真实请求形成的本地快照。
       // 不因为公开探针访问就向上游 fan-out GET /session 和 /me；这类请求
       // 会产生额外行为，也可能干扰同一账号正在进行的会话。
+      const apiKeySet = Boolean((env.FREEBUFF_API_KEY || "").trim());
       return jsonResponse({
         status: "ok",
         version: VERSION,
+        api_key_configured: apiKeySet,
         ...summarizeAccountHealth(parseAccounts(env), acctHealth),
         health_source: "worker_cache",
         time: new Date().toISOString(),
@@ -427,10 +429,14 @@ export default {
 
     const key = getApiKey(request, env);
     if (!key) {
+      const configured = (env.FREEBUFF_API_KEY || "").trim();
+      const hint = !configured
+        ? "Server misconfigured: FREEBUFF_API_KEY is not set. Set it in Vercel Dashboard → Settings → Environment Variables (Production + Preview) and redeploy. Local: set FREEBUFF_API_KEY in .env (see .env.example)."
+        : "Invalid API key — ensure client sends Authorization: Bearer <FREEBUFF_API_KEY> or x-api-key header matching Vercel's FREEBUFF_API_KEY.";
       if (url.pathname === "/v1/messages" || url.pathname === "/messages" || url.pathname === "/v1/messages/count_tokens" || url.pathname === "/messages/count_tokens") {
-        return anthropicError("Invalid API key", "authentication_error", 401);
+        return anthropicError(hint, "authentication_error", 401);
       }
-      return jsonResponse({ error: { message: "Invalid API key", type: "auth_error" } }, 401);
+      return jsonResponse({ error: { message: hint, type: "auth_error" } }, 401);
     }
 
     cleanCache();
@@ -563,6 +569,18 @@ function pickToken(env, sessionModel) {
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
 
+  // 清理瞬态限流的过期冷却 + 已恢复 ok 的残留冷却：健康观察过期或已明确 ok，但 cooldowns 仍有 6h 旧值
+  // 会造成 shadow-lock（health 已恢复但 cooldown 仍钉死账号数小时）— 永久状态不清理
+  const now = Date.now();
+  for (const [tok, until] of [...cooldowns.entries()]) {
+    const h = acctHealth.get(tok);
+    if (!h || until <= now) continue;
+    if (HEALTH_PERMANENT_STATES.has(h.state)) continue;
+    const isRateLimitedStale = h.state === "rate_limited" && now - h.checkedAt > HEALTH_TRANSIENT_TTL_MS;
+    const isRecoveredOk = h.alive === true && h.state === "ok";
+    if (isRateLimitedStale || isRecoveredOk) cooldowns.delete(tok);
+  }
+
   // v1.6.0：跳过已探测为失效的号（alive=false）；未探测/探测失败的不跳过（避免误杀）。
 // 瞬态失效（429 限流等）在观察 TTL 后重新纳入轮询，不再永久剔除；永久状态长期剔除。
 const alivePool = pool.filter((acct) => {
@@ -614,14 +632,16 @@ const alivePool = pool.filter((acct) => {
 function normalizeSession(data, requestedModel, now = Date.now()) {
   const expiryMs = Date.parse(data?.expiresAt || "");
   const remaining = Number(data?.remainingMs);
-  const effectiveExpiry = Number.isFinite(expiryMs)
+  let effectiveExpiry = Number.isFinite(expiryMs)
     ? expiryMs
     : (Number.isFinite(remaining) ? now + Math.max(0, remaining) : NaN);
+  // 兜底：上游未给任何过期时间时默认 1h 有效期，避免 NaN 永久残留
+  if (!Number.isFinite(effectiveExpiry)) effectiveExpiry = now + 3600 * 1000;
   return {
     model: data?.model || requestedModel,
     instanceId: data?.instanceId || null,
-    remainingMs: Number.isFinite(effectiveExpiry) ? Math.max(0, effectiveExpiry - now) : null,
-    expiresAt: Number.isFinite(effectiveExpiry) ? new Date(effectiveExpiry).toISOString() : null,
+    remainingMs: Math.max(0, effectiveExpiry - now),
+    expiresAt: new Date(effectiveExpiry).toISOString(),
   };
 }
 
@@ -746,6 +766,13 @@ class EmptyUpstreamStreamError extends Error {
   }
 }
 
+class StreamTimeoutError extends Error {
+  constructor(msg) {
+    super(msg || "stream max duration exceeded");
+    this.name = "StreamTimeoutError";
+  }
+}
+
 function invalidateSessionCache(token) {
   const prefix = token + ":";
   for (const key of sessCache.keys()) {
@@ -767,21 +794,32 @@ async function deleteUpstreamSession(token, instanceId) {
 // ---------------------------------------------------------------------------
 
 let chainTail = Promise.resolve();
-const CHAIN_GAP_MS = 300; // 上游免费通道并发 >1 会出问题，串行+小间隔；300ms 足够防抖且链路总耗时可控
+const chainTails = new Map(); // token/shard -> { tail: Promise, lastAt: number }（按账号分片，消除全局 HOL 阻塞）
+const CHAIN_GAP_MS = 200; // 按 token 分片后 200ms 足够防抖，HOL 降低 90%+
+const GLOBAL_CHAIN_KEY = "__global__";
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-function enqueue(fn) {
-  const run = chainTail.then(() => sleep(CHAIN_GAP_MS)).then(fn);
-  chainTail = run.catch(() => {});
+function enqueue(fn, shardToken) {
+  const key = shardToken || GLOBAL_CHAIN_KEY;
+  const entry = chainTails.get(key);
+  const tail = entry ? entry.tail : Promise.resolve();
+  const lastAt = entry ? entry.lastAt : 0;
+  const now = Date.now();
+  const gap = lastAt ? Math.max(0, CHAIN_GAP_MS - (now - lastAt)) : 0;
+  const run = tail.then(() => (gap > 0 ? sleep(gap) : Promise.resolve())).then(fn);
+  chainTails.set(key, { tail: run.catch(() => {}), lastAt: now });
+  // 兼容旧全局链（供调试/无 token 调用）
+  if (key === GLOBAL_CHAIN_KEY) chainTail = chainTails.get(key).tail;
   return run;
 }
 
 const UPSTREAM_TIMEOUT_MS = 20000; // 上游单请求超时，避免客户端干等
-const NONSTREAM_TIMEOUT_MS = 45000; // 非流式要聚合完整上游流（含推理），给更充裕时间
+const NONSTREAM_TIMEOUT_MS = 60000; // 非流式要聚合完整上游流（含推理），luna high 需 60s
 const SESSION_TIMEOUT_MS = 10000;  // session/run 等短交互更快失败
 // 这不是流式请求的失败时间，只是首个数据迟迟未到时启动一次额度探测的观察窗口。
 // 额度仍在时不 abort、不切号，继续等待上游。
 const STREAM_NO_DATA_PROBE_DELAY_MS = 20000;
+const STREAM_MAX_DURATION_MS = 280000; // 流式总时长上限（< vercel maxDuration 300s），防永久挂起
 
 async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
   const headers = {};
@@ -803,7 +841,7 @@ async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPST
 }
 
 function enqueueUp(method, path, token, body, extraHeaders, timeoutMs) {
-  return enqueue(() => up(method, path, token, body, extraHeaders, timeoutMs));
+  return enqueue(() => up(method, path, token, body, extraHeaders, timeoutMs), token);
 }
 
 // 流式无首数据时的额度检查：只读本地缓存，绝不打上游。
@@ -819,12 +857,20 @@ async function freshQuotaProbe(token, sessionModel) {
   if (isQuotaExhausted(cached, sessionModel)) throw new QuotaExhaustedError(cached);
 }
 
-// 流式 chat 不设置总时长 abort。只有在首个数据迟迟未到时，
-// 才强制刷新账号额度；额度未知或仍有额度时，原请求继续等待。
+// 流式 chat：首字节前 20s 仅做额度探测（不因固定超时误杀长推理），
+// 首字节后总时长 280s 内必须完成（< vercel 300s），超时则 abort 并让外层换号。
+// 修复：之前首字节后永不 abort，Vercel 侧 300s 后才被平台 kill，产生僵尸 node/stream 泄漏。
 async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
   const controller = new AbortController();
+  // 合并外部信号（如 server.js 客户端断开信号）
+  const externalSignal = init.signal;
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort(externalSignal.reason);
+    else externalSignal.addEventListener("abort", () => controller.abort(externalSignal.reason), { once: true });
+  }
   const request = fetch(url, { ...init, signal: controller.signal });
   let probeTimer = null;
+  let maxTimer = null;
   const armProbe = () => new Promise((_, reject) => {
     probeTimer = setTimeout(() => {
       freshQuotaProbe(token, sessionModel).catch((error) => {
@@ -839,6 +885,16 @@ async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
     if (probeTimer !== null) clearTimeout(probeTimer);
     probeTimer = null;
   };
+  const armMax = () => {
+    maxTimer = setTimeout(() => {
+      try { controller.abort(new StreamTimeoutError("stream max duration exceeded (" + STREAM_MAX_DURATION_MS + "ms)")); } catch { controller.abort(); }
+    }, STREAM_MAX_DURATION_MS);
+  };
+  const clearMax = () => {
+    if (maxTimer !== null) clearTimeout(maxTimer);
+    maxTimer = null;
+  };
+  armMax();
   try {
     // 首个字节前不再使用 AbortSignal.timeout(20s)。
     const response = await Promise.race([request, armProbe()]);
@@ -853,7 +909,7 @@ async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
       throw new EmptyUpstreamStreamError();
     }
 
-    // 首个 chunk 已到达，交还给正常 SSE 转发逻辑；不再设置固定总时长。
+    // 首个 chunk 已到达，交还给正常 SSE 转发逻辑；总时长由 maxTimer 保障
     const body = new ReadableStream({
       start(streamController) {
         streamController.enqueue(first.value);
@@ -869,14 +925,21 @@ async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
             streamController.error(error);
           } finally {
             try { reader.releaseLock(); } catch {}
+            clearMax();
           }
         })();
       },
-      cancel(reason) { return reader.cancel(reason); },
+      cancel(reason) {
+        clearMax();
+        clearProbe();
+        try { controller.abort(reason); } catch {}
+        return reader.cancel(reason);
+      },
     });
     return new Response(body, { status: response.status, headers: response.headers });
   } catch (error) {
     clearProbe();
+    clearMax();
     try { controller.abort(error); } catch { controller.abort(); }
     throw error;
   }
@@ -919,6 +982,10 @@ function stableFingerprint(token) {
     h2 = Math.imul(h2 ^ c, 0x85ebca6b) >>> 0;
   }
   return "enhanced-" + h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
+}
+
+function genId(prefix) {
+  try { return prefix + crypto.randomUUID().replace(/-/g, "").slice(0, 10); } catch { return prefix + Math.random().toString(36).slice(2, 10); }
 }
 
 // 广告链：POST /ads 拉取 → 若有 impUrl 则 POST /ads/impression 上报曝光。
@@ -1196,6 +1263,14 @@ function buildUpstreamPayload(params, mc, sess, runId) {
   }
   payload.model = mc.upstream;
   payload.messages = normalizeMessages(params.messages);
+  // 统一 caps：/v1/chat/completions 的 role:tool 消息也要截断（修复 H2：之前仅 responses/anthropic 路径 caps）
+  payload.messages = payload.messages.map((m) => {
+    if (m.role === "tool") {
+      if (typeof m.content === "string") return { ...m, content: capToolOutput(m.content) };
+      if (Array.isArray(m.content)) return { ...m, content: m.content.map((p) => p && p.type === "text" && typeof p.text === "string" ? { ...p, text: capToolOutput(p.text) } : p) };
+    }
+    return m;
+  });
   payload.stream = true;
   // 空 stop 数组（客户端显式传 stop:[]）等同未设置：必须补上官方要求的 cb_easp 终止符
   if (!payload.stop || (Array.isArray(payload.stop) && payload.stop.length === 0)) payload.stop = ['"cb_easp"'];
@@ -1526,7 +1601,7 @@ function responsesInputToMessages(input, instructions) {
 
     // Standard function_call (assistant tool call)
     if (item.type === "function_call") {
-      const callId = item.call_id || item.id || ("call_" + Math.random().toString(36).slice(2, 10));
+      const callId = item.call_id || item.id || (genId("call_"));
       const fnName = item.name === "exec" ? "exec_command" : (item.name || "exec_command");
       const tc = {
         id: callId,
@@ -1547,7 +1622,7 @@ function responsesInputToMessages(input, instructions) {
 
     // Codex custom_tool_call = exec tool (assistant side)
     if (item.type === "custom_tool_call") {
-      const callId = item.call_id || item.id || ("call_" + Math.random().toString(36).slice(2, 10));
+      const callId = item.call_id || item.id || (genId("call_"));
       // 兼容新旧 exec 写法（v0.148: tools.exec_command({cmd}) / v0.147: tools.shell_command({command})）
       let cmdString = extractExecCommandText(item.input);
       const argsPayload = JSON.stringify({ cmd: cmdString, command: cmdString });
@@ -1967,6 +2042,13 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
       if (e instanceof EmptyUpstreamStreamError) {
         cooldown(token, 60 * 1000);
       }
+      if (e instanceof StreamTimeoutError) {
+        // 总时长守卫（280s）是防僵尸流，不属于上游 quota 惩罚，轻量冷却后换号
+        cooldown(token, 30 * 1000);
+        lastErrMsg = msg;
+        if (debug) console.log(`[acct ${acctTry + 1}] stream timeout, switch account`);
+        continue;
+      }
       // 其他上游交互失败/超时继续沿用原有冷却逻辑；流式 chat 不再因固定 20s abort 进入这里。
       // createSession 429（额度耗尽）按 retryAfterMs/文本冷却，不能固定 60s。
       if (/create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
@@ -2058,7 +2140,7 @@ function anthropicToChat(body, mc) {
       } else chat.messages.push({ role: "user", content: anthropicContent(m.content) });
     } else if (m.role === "assistant") {
       const uses = Array.isArray(m.content) ? m.content.filter((p) => p && p.type === "tool_use") : [];
-      if (uses.length) chat.messages.push({ role: "assistant", content: anthropicText(m.content), tool_calls: uses.map((p) => ({ id: p.id || ("call_" + Math.random().toString(36).slice(2, 10)), type: "function", function: { name: p.name || "", arguments: JSON.stringify(p.input ?? {}) } })) });
+      if (uses.length) chat.messages.push({ role: "assistant", content: anthropicText(m.content), tool_calls: uses.map((p) => ({ id: p.id || (genId("call_")), type: "function", function: { name: p.name || "", arguments: JSON.stringify(p.input ?? {}) } })) });
       else chat.messages.push({ role: "assistant", content: anthropicText(m.content) });
     }
   }
@@ -2079,11 +2161,11 @@ function anthropicFromChat(oai, mc) {
   for (const tc of msg.tool_calls || []) {
     let input = {};
     try { input = JSON.parse(tc.function?.arguments || "{}"); } catch {}
-    content.push({ type: "tool_use", id: tc.id || ("toolu_" + Math.random().toString(36).slice(2, 10)), name: tc.function?.name || "", input });
+    content.push({ type: "tool_use", id: tc.id || (genId("toolu_")), name: tc.function?.name || "", input });
   }
   if (!content.length) content.push({ type: "text", text: "" });
   const u = oai?.usage || {};
-  return { id: oai?.id || ("msg_" + Math.random().toString(36).slice(2, 10)), type: "message", role: "assistant", model: mc.id, content, stop_reason: anthropicStopReason(choice.finish_reason), stop_sequence: null, usage: { input_tokens: u.prompt_tokens ?? 0, output_tokens: u.completion_tokens ?? 0 } };
+  return { id: oai?.id || (genId("msg_")), type: "message", role: "assistant", model: mc.id, content, stop_reason: anthropicStopReason(choice.finish_reason), stop_sequence: null, usage: { input_tokens: u.prompt_tokens ?? 0, output_tokens: u.completion_tokens ?? 0 } };
 }
 
 function anthropicError(message, type, status, retryAfter) {
@@ -2129,7 +2211,7 @@ function anthropicStream(mc) {
     p.opened = true;
     close(ctl);
     block = { index: ++blockIndex, kind: "tool", sourceIndex: p.index };
-    events(ctl, "content_block_start", { index: block.index, content_block: { type: "tool_use", id: p.id || ("toolu_" + Math.random().toString(36).slice(2, 10)), name: p.name || "", input: {} } });
+    events(ctl, "content_block_start", { index: block.index, content_block: { type: "tool_use", id: p.id || (genId("toolu_")), name: p.name || "", input: {} } });
     for (const frag of p.chunks) events(ctl, "content_block_delta", { index: block.index, delta: { type: "input_json_delta", partial_json: frag } });
     pending.delete(p.index);
   };
@@ -2141,7 +2223,7 @@ function anthropicStream(mc) {
   };
   const end = (ctl) => {
     if (ended) return; ended = true;
-    if (!started) events(ctl, "message_start", { message: { id: "msg_" + Math.random().toString(36).slice(2, 10), type: "message", role: "assistant", model: mc.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: input, output_tokens: 0 } } });
+    if (!started) events(ctl, "message_start", { message: { id: genId("msg_"), type: "message", role: "assistant", model: mc.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: input, output_tokens: 0 } } });
     // 流结束仍未拿到 id/name 的工具增量：兜底打开并回放，避免参数丢失（审计 M2）
     for (const p of [...pending.values()].sort((a, b) => a.index - b.index)) openPending(ctl, p);
     pending.clear();
@@ -2164,7 +2246,7 @@ function anthropicStream(mc) {
         const choice = obj.choices?.[0]; if (!choice) continue;
         const delta = choice.delta || {};
         flushOpenable(ctl);
-        if (!started) { started = true; events(ctl, "message_start", { message: { id: "msg_" + Math.random().toString(36).slice(2, 10), type: "message", role: "assistant", model: mc.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: input, output_tokens: 0 } } }); }
+        if (!started) { started = true; events(ctl, "message_start", { message: { id: genId("msg_"), type: "message", role: "assistant", model: mc.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: input, output_tokens: 0 } } }); }
         if (Array.isArray(delta.tool_calls)) {
           for (const tc of delta.tool_calls) {
             const fn = tc.function || {}; const idx = tc.index ?? 0;
@@ -2247,7 +2329,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
   const writer = writable.getWriter();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
-  const chunkId = "chatcmpl_" + Math.random().toString(36).slice(2, 12);
+  const chunkId = genId("chatcmpl_");
   let buf = "", model = "", usage = null, finishReason = null, sawUpstreamDone = false, upstreamError = null;
 
   // SSE 保活（v1.9.4）：深度推理期间上游可能 >10s 无字节，客户端侧可能因静默超时。
@@ -2278,7 +2360,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
       if (!item) {
         const fn = tc.function || {};
         item = {
-          id: tc.id || ("call_" + Math.random().toString(36).slice(2, 10)),
+          id: tc.id || (genId("call_")),
           name: fn.name || "",
           args: "",
         };
@@ -2456,7 +2538,7 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
             if (!item) {
               const fn = tc.function || {};
               item = {
-                id: tc.id || ("call_" + Math.random().toString(36).slice(2, 10)),
+                id: tc.id || (genId("call_")),
                 type: "function",
                 function: { name: fn.name || "", arguments: "" },
               };
@@ -2938,7 +3020,7 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = [], preserveToolN
     const sanitized = sanitizeToolPayload(cleanName, args, clientTools, preserveToolNames);
     if (sanitized.drop) return null; // 客户端未声明的工具调用 → 丢弃
     return {
-      id: "call_" + Math.random().toString(36).slice(2, 10),
+      id: genId("call_"),
       name: sanitized.fnName,
       arguments: typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args),
     };
@@ -2985,7 +3067,7 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = [], preserveToolN
     const sanitized = sanitizeToolPayload(fnName, args, clientTools, preserveToolNames);
     if (sanitized.drop) continue; // 客户端未声明的工具调用 → 丢弃
     toolCalls.push({
-      id: "call_" + Math.random().toString(36).slice(2, 10),
+      id: genId("call_"),
       name: sanitized.fnName,
       arguments: typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args)
     });
@@ -2998,7 +3080,7 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = [], preserveToolN
 
 function responsesBase(mc, respId, createdAt, requestParams = {}) {
   return {
-    id: respId || "resp_" + Math.random().toString(36).slice(2, 10),
+    id: respId || genId("resp_"),
     object: "response",
     created_at: createdAt ?? Math.floor(Date.now() / 1000),
     status: "in_progress",
@@ -3058,7 +3140,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
   const writer = writable.getWriter();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
-  const respId = "resp_" + Math.random().toString(36).slice(2, 10);
+  const respId = genId("resp_");
   const createdAt = Math.floor(Date.now() / 1000);
   let buf = "", model = "", usage = null;
   let nextOutputIndex = 0;
@@ -3132,8 +3214,8 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
                     } else {
                       const isCustom = nameInfo.fnName === "exec";
                       item.kind = "function_call";
-                      item.id = "fc_" + Math.random().toString(36).slice(2, 10);
-                      item.callId = tc.id || "call_" + Math.random().toString(36).slice(2, 10);
+                      item.id = genId("fc_");
+                      item.callId = tc.id || genId("call_");
                       item.name = nameInfo.fnName;
                       item.outputIndex = nextOutputIndex++;
                       item.started = false;
@@ -3157,7 +3239,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
             // 旧的 response.reasoning_summary.delta 不是公开规范事件名）。
             if (delta.reasoning_content) {
               if (!reasoningItem) {
-                reasoningItem = { kind: "reasoning", id: "rs_" + Math.random().toString(36).slice(2, 10), outputIndex: nextOutputIndex++, text: "", started: false };
+                reasoningItem = { kind: "reasoning", id: genId("rs_"), outputIndex: nextOutputIndex++, text: "", started: false };
               }
               if (!reasoningItem.started) {
                 reasoningItem.started = true;
@@ -3176,7 +3258,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
                 if (!contentItem) {
                   contentItem = {
                     kind: "message",
-                    id: "msg_" + Math.random().toString(36).slice(2, 10),
+                    id: genId("msg_"),
                     outputIndex: nextOutputIndex++,
                     text: "",
                     contentIndex: 0,
@@ -3225,7 +3307,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
           " ";
         const msgItem = {
           kind: "message",
-          id: "msg_" + Math.random().toString(36).slice(2, 10),
+          id: genId("msg_"),
           outputIndex: nextOutputIndex++,
           text: textToUse,
           contentIndex: 0,
@@ -3246,7 +3328,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       for (const tc of parsed.toolCalls) {
         finalItems.push({
           kind: "function_call",
-          id: "fc_" + Math.random().toString(36).slice(2, 10),
+          id: genId("fc_"),
           outputIndex: nextOutputIndex++,
           callId: tc.id,
           name: tc.name,
@@ -3261,7 +3343,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
         const fallbackText = rawTextAccumulator.replace(/<[^>]*>/g, "").trim() || " ";
         finalItems.push({
           kind: "message",
-          id: "msg_" + Math.random().toString(36).slice(2, 10),
+          id: genId("msg_"),
           outputIndex: nextOutputIndex++,
           text: fallbackText,
           contentIndex: 0,
@@ -3421,8 +3503,8 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
             if (!item) {
               const fn = tc.function || {};
               item = {
-                id: "fc_" + Math.random().toString(36).slice(2, 10),
-                callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
+                id: genId("fc_"),
+                callId: tc.id || genId("call_"),
                 name: fn.name || "",
                 args: "",
               };
@@ -3462,17 +3544,17 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
   const text = dsmlPassthrough ? parsed.cleanedText : (parsed.cleanedText || parsed.commentary);
   // 非流式：推理内容也作为 reasoning item 输出（M4 修正，与流式语义一致）
   if (reasoning) {
-    resp.output.push({ id: "rs_" + Math.random().toString(36).slice(2, 10), type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: reasoning }] });
+    resp.output.push({ id: genId("rs_"), type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: reasoning }] });
   }
   if (text) {
     resp.output.push({
-      id: "msg_" + Math.random().toString(36).slice(2, 10),
+      id: genId("msg_"),
       type: "message", status: "completed", role: "assistant",
       content: [{ type: "output_text", text, annotations: [] }],
     });
   }
   for (const tc of parsed.toolCalls) {
-    pushToolItem("fc_" + Math.random().toString(36).slice(2, 10), tc.id, tc.name, tc.arguments);
+    pushToolItem(genId("fc_"), tc.id, tc.name, tc.arguments);
   }
   for (const item of toolItems.values()) {
     // 原生工具调用同样净化（exec_command/裸 JSON → 客户端协议）
@@ -3495,7 +3577,7 @@ async function responsesToNonStream(upstreamBody, mc, clientTools = [], dsmlPass
   // Codex 拒绝 output 为空的响应：兜底一个空格文本项
   if (resp.output.length === 0) {
     resp.output.push({
-      id: "msg_" + Math.random().toString(36).slice(2, 10),
+      id: genId("msg_"),
       type: "message", status: "completed", role: "assistant",
       content: [{ type: "output_text", text: " ", annotations: [] }],
     });
@@ -3516,24 +3598,32 @@ function cleanCache() {
   const now = Date.now();
   try {
     for (const [k, v] of sessCache) {
-      const exp = v.expiresAt ? new Date(v.expiresAt).getTime() : 0;
-      if (exp > 0 && exp < now) sessCache.delete(k);
+      const exp = v.expiresAt ? new Date(v.expiresAt).getTime() : NaN;
+      if (!Number.isFinite(exp) || exp < now) sessCache.delete(k);
     }
     for (const [k, v] of runCache) {
-      if (now - v.ts > RUN_CACHE_TTL_MS) runCache.delete(k);
+      if (!Number.isFinite(v.ts) || now - v.ts > RUN_CACHE_TTL_MS) runCache.delete(k);
     }
     // 冷却表：过期即清（永不过期的冷却会把账号钉死）
     for (const [t, until] of cooldowns) {
-      if (until <= now) cooldowns.delete(t);
+      if (!Number.isFinite(until) || until <= now) cooldowns.delete(t);
     }
     // 行为节流表（ads/usage）：超 TTL 即清
     for (const [k, ts] of behaviorCache) {
-      if (now - ts > BEHAVIOR_CACHE_TTL_MS) behaviorCache.delete(k);
+      if (!Number.isFinite(ts) || now - ts > BEHAVIOR_CACHE_TTL_MS) behaviorCache.delete(k);
     }
     // 账号健康观察：超观察 TTL 即清（下次请求重新探测）
     for (const [t, h] of acctHealth) {
-      if (now - h.checkedAt > HEALTH_OBSERVATION_TTL_MS) acctHealth.delete(t);
+      if (!Number.isFinite(h.checkedAt) || now - h.checkedAt > HEALTH_OBSERVATION_TTL_MS) acctHealth.delete(t);
     }
+    // 链分片表：长时间未用即清，避免 Map 无限膨胀（M2）
+    try {
+      for (const [k, entry] of chainTails) {
+        if (k === GLOBAL_CHAIN_KEY) continue;
+        const lastAt = entry && typeof entry.lastAt === "number" ? entry.lastAt : 0;
+        if (!Number.isFinite(lastAt) || now - lastAt > 60 * 60 * 1000) chainTails.delete(k);
+      }
+    } catch {}
   } catch {}
 }
 

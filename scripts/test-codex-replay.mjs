@@ -61,12 +61,20 @@ globalThis.fetch = async (url, init = {}) => {
   throw new Error("mock: unexpected upstream URL " + u);
 };
 
+// Harness guard
+const TEST_READ_TIMEOUT_MS = 6000;
+function withTimeout(promise, ms, label) {
+  return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timeout " + ms + "ms")), ms))]);
+}
+let suiteTimer = setTimeout(() => { console.error("SUITE TIMEOUT 30s — likely reader leak"); process.exit(1); }, 30000);
+if (suiteTimer.unref) suiteTimer.unref();
+
 async function readSSE(res) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = "", events = [];
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await withTimeout(reader.read(), TEST_READ_TIMEOUT_MS, "readSSE");
     if (done) break;
     buf += dec.decode(value, { stream: true });
     let i;
@@ -305,6 +313,7 @@ for (const name of ["004", "005", "006", "007", "008", "009", "010", "011", "012
   check(tag + " response completed or tool_calls", events.some((e) => e.type === "response.completed" || (e.type === "response.output_item.added" && e.item.type === "custom_tool_call")), "");
 }
 
+clearTimeout(suiteTimer);
 const passed = results.filter((r) => r.ok).length;
 console.log(`\n=== ${passed}/${results.length} passed ===`);
 process.exit(passed === results.length ? 0 : 1);

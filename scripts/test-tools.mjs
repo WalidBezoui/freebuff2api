@@ -56,12 +56,21 @@ globalThis.fetch = async (url, init = {}) => {
   throw new Error("mock: unexpected upstream URL " + u);
 };
 
+// Harness: timeout + leak guard（修复 transcript 中 253s collect/buffer 挂起）
+const TEST_READ_TIMEOUT_MS = 6000;
+function withTimeout(promise, ms, label) {
+  return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timeout " + ms + "ms")), ms))]);
+}
+const _origFetch = globalThis.fetch;
+let suiteTimer = setTimeout(() => { console.error("SUITE TIMEOUT 30s — likely reader/keepAlive leak"); process.exit(1); }, 30000);
+if (suiteTimer.unref) suiteTimer.unref();
+
 async function readSSE(res) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = "", events = [];
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await withTimeout(reader.read(), TEST_READ_TIMEOUT_MS, "readSSE");
     if (done) break;
     buf += dec.decode(value, { stream: true });
     let i;
@@ -450,7 +459,7 @@ async function readRawSSE(res) {
   const dec = new TextDecoder();
   let buf = "", raw = [];
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await withTimeout(reader.read(), TEST_READ_TIMEOUT_MS, "readRawSSE");
     if (done) break;
     buf += dec.decode(value, { stream: true });
     let i;
@@ -1028,6 +1037,8 @@ async function readRawSSE(res) {
   check("T44 Anthropic tool_result capped (marker present)", !!toolMsg && toolMsg.content.includes("truncated by freebuff2api"), JSON.stringify(toolMsg).slice(0, 120));
 }
 
+clearTimeout(suiteTimer);
 const failed = results.filter((r) => !r.ok);
 console.log("\n=== " + (results.length - failed.length) + "/" + results.length + " passed ===");
+if (_origFetch) globalThis.fetch = _origFetch;
 process.exit(failed.length ? 1 : 0);

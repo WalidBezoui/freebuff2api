@@ -68,6 +68,7 @@ const env = {
   FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
   CODEBUFF_API: process.env.CODEBUFF_API || '',
   RELAY_KEY: process.env.RELAY_KEY || '',
+  FREEBUFF_MAX_TOOL_OUTPUT: process.env.FREEBUFF_MAX_TOOL_OUTPUT || '',
 };
 
 if (!env.FREEBUFF_API_KEY) {
@@ -83,41 +84,81 @@ const port = parseInt(process.env.PORT || '8787', 10);
 const host = process.env.HOST || '0.0.0.0';
 
 const server = createServer(async (nodeReq, nodeRes) => {
+  const abortCtrl = new AbortController();
+  const onClose = () => { try { abortCtrl.abort(new Error("client disconnect")); } catch {} };
+  nodeReq.on("close", onClose);
   try {
-    // Build array of raw bytes from Node request
+    // Body 读取带上限：超 1MiB 直接 413，避免 Buffer.concat OOM（worker 也会二次校验）
     const chunks = [];
-    for await (const chunk of nodeReq) chunks.push(chunk);
+    let total = 0;
+    const MAX_BODY = 1024 * 1024;
+    for await (const chunk of nodeReq) {
+      total += chunk.length;
+      if (total > MAX_BODY) {
+        if (!nodeRes.headersSent) {
+          nodeRes.writeHead(413, { "content-type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: { message: "Request body too large (limit " + MAX_BODY + " bytes)", type: "invalid_request_error" } }));
+        } else if (!nodeRes.writableEnded) nodeRes.end();
+        try { nodeReq.destroy(); } catch {}
+        return;
+      }
+      chunks.push(chunk);
+    }
     const body = Buffer.concat(chunks);
 
-    // Build a CF-compatible Request
+    // Build a CF-compatible Request（带 abort 信号，客户端断开时可取消上游）
     const url = `http://${nodeReq.headers.host || 'localhost'}${nodeReq.url}`;
     const request = new Request(url, {
       method: nodeReq.method,
       headers: new Headers(nodeReq.headers),
       body: body.length > 0 ? body : null,
+      signal: abortCtrl.signal,
     });
 
     // Call the worker's fetch handler
     const response = await handler.fetch(request, env);
 
-    // Write response back to Node socket
+    // Write response back to Node socket（带背压 + abort 竞争，避免 drain 永久挂起 H3）
     nodeRes.writeHead(response.status, Object.fromEntries(response.headers.entries()));
     if (response.body) {
       const reader = response.body.getReader();
       try {
         while (true) {
+          if (abortCtrl.signal.aborted) {
+            try { await reader.cancel(abortCtrl.signal.reason); } catch {}
+            break;
+          }
           const { done, value } = await reader.read();
           if (done) break;
-          if (value) nodeRes.write(Buffer.from(value));
+          if (value) {
+            if (abortCtrl.signal.aborted) break;
+            const ok = nodeRes.write(Buffer.from(value));
+            if (!ok) {
+              await Promise.race([
+                new Promise((res) => nodeRes.once("drain", res)),
+                new Promise((res) => {
+                  const onAbort = () => res();
+                  abortCtrl.signal.addEventListener("abort", onAbort, { once: true });
+                  nodeRes.once("close", onAbort);
+                }),
+              ]);
+              if (abortCtrl.signal.aborted) break;
+            }
+          }
         }
       } catch (err) {
         // Stream errors are expected on client disconnect
+        try { await reader.cancel(err).catch(() => {}); } catch {}
         if (!nodeRes.writableEnded) nodeRes.end();
         return;
       }
     }
     if (!nodeRes.writableEnded) nodeRes.end();
   } catch (err) {
+    if (abortCtrl.signal.aborted) {
+      if (!nodeRes.writableEnded) try { nodeRes.end(); } catch {}
+      return;
+    }
     console.error('[server] request error:', err.message);
     if (!nodeRes.headersSent) {
       nodeRes.writeHead(502, { 'content-type': 'application/json' });
@@ -125,6 +166,8 @@ const server = createServer(async (nodeReq, nodeRes) => {
     } else if (!nodeRes.writableEnded) {
       nodeRes.end();
     }
+  } finally {
+    nodeReq.off("close", onClose);
   }
 });
 

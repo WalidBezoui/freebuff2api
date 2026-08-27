@@ -1,8 +1,8 @@
 FROM node:20-alpine
 WORKDIR /app
 
-# Only server.js + worker.js needed; no npm deps
-COPY package.json server.js worker.js ./
+# server.js + worker.js + deps (load-env + models fallback)
+COPY package.json server.js worker.js load-env.mjs freebuff-models.json ./
 
 # Create credentials dir (mounted at runtime)
 RUN mkdir -p /app/credentials && chown -R node:node /app

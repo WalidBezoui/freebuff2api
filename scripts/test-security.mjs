@@ -4,6 +4,9 @@
  */
 import worker from "../worker.js";
 
+let suiteTimer = setTimeout(() => { console.error("SUITE TIMEOUT 30s"); process.exit(1); }, 30000);
+if (suiteTimer.unref) suiteTimer.unref();
+
 const TOKEN = "tok_mock_123456789";
 const KEY = "sk-test-key-123";
 const ENV = { FREEBUFF_TOKEN: TOKEN, FREEBUFF_API_KEY: KEY, FREEBUFF_DEBUG: "false" };
@@ -155,6 +158,7 @@ const mkAnthReq = (path, body) => new Request("https://localhost" + path, { meth
   check("S4 healthz has version", !!j.version, "version=" + j.version);
 }
 
+clearTimeout(suiteTimer);
 const passed = results.filter((r) => r.ok).length;
 console.log(`\n=== ${passed}/${results.length} passed ===`);
 if (passed !== results.length) process.exit(1);

@@ -1,9 +1,7 @@
-version: "3.8"
-
 services:
   freebuff2api:
     build: .
-    image: freebuff2api:1.9.4
+    image: freebuff2api:1.9.5
     container_name: freebuff2api
     restart: unless-stopped
     ports:
@@ -16,5 +14,6 @@ services:
       - RELAY_KEY=${RELAY_KEY}
       - FREEBUFF_API_KEY=${FREEBUFF_API_KEY}
       - FREEBUFF_DEBUG=false
+      - FREEBUFF_MAX_TOOL_OUTPUT=${FREEBUFF_MAX_TOOL_OUTPUT:-}
     volumes:
       - ./credentials:/app/credentials:ro
