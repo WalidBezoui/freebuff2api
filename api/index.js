@@ -18,8 +18,8 @@ export default async function handler(req, res) {
 
   const abortCtrl = new AbortController();
   const onClose = () => { try { abortCtrl.abort(new Error("client disconnect")); } catch {} };
-  // Vercel Node req 是可读流，支持 close 事件
-  if (req && typeof req.on === "function") req.on("close", onClose);
+  // Vercel Node res close 才是客户端断开（req close 是请求体结束，不是断开）
+  if (res && typeof res.on === "function") res.on("close", onClose);
   let body;
   try {
     const chunks = [];
@@ -91,6 +91,6 @@ export default async function handler(req, res) {
       res.end();
     }
   } finally {
-    if (req && typeof req.off === "function") req.off("close", onClose);
+    if (res && typeof res.off === "function") res.off("close", onClose);
   }
 }

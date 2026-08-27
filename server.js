@@ -86,7 +86,7 @@ const host = process.env.HOST || '0.0.0.0';
 const server = createServer(async (nodeReq, nodeRes) => {
   const abortCtrl = new AbortController();
   const onClose = () => { try { abortCtrl.abort(new Error("client disconnect")); } catch {} };
-  nodeReq.on("close", onClose);
+  nodeRes.on("close", onClose);
   try {
     // Body 读取带上限：超 1MiB 直接 413，避免 Buffer.concat OOM（worker 也会二次校验）
     const chunks = [];
@@ -167,7 +167,7 @@ const server = createServer(async (nodeReq, nodeRes) => {
       nodeRes.end();
     }
   } finally {
-    nodeReq.off("close", onClose);
+    nodeRes.off("close", onClose);
   }
 });
 
