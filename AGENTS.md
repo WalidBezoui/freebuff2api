@@ -72,3 +72,18 @@ This document contains critical architectural context, upstream quota constraint
    - F2: suppression is a **name-aware stack** (`suppressStack`), not a depth counter — mismatched closing tags must not shift state.
 9. **Responses Reasoning (`reasoning_item`)**:
    - Reasoning is a real `reasoning` output item; the spec event is `response.reasoning_summary_text.delta` (not `response.reasoning_summary.delta`), with `output_item.added`/`content_part.added` before it and `.done`/`content_part.done`/`output_item.done` at the end.
+
+---
+
+## 4. Client Authentication & Diagnostic Invariants
+
+1. **401 Unauthorized Diagnosis (Local Proxy vs. Upstream)**:
+   - Any error with `401 Unauthorized: Invalid API key — ensure client sends Authorization: Bearer <FREEBUFF_API_KEY>...` is generated **locally by `worker.js` auth gate**, NOT upstream Codebuff.
+   - Codebuff never receives rejected 401 requests. A 401 error is an authentication misconfiguration between the client (Codex/Claude) and the proxy, **never** an upstream account ban or detection.
+2. **Codex CLI Configuration (`~/.codex/config.toml`)**:
+   - For custom providers with `wire_api = "responses"`, specify `env_key = "FREEBUFF_API_KEY"`.
+   - Ensure `$env:FREEBUFF_API_KEY` is set in the environment so Codex attaches the bearer token.
+3. **Batch Launcher Invariant**:
+   - All batch files (`4-Launch-Codex.bat`, `5-Launch-Codex-GUI.bat`, `6-Launch-Claude-Code.bat`) must include:
+     `if "%FREEBUFF_API_KEY%"=="" set FREEBUFF_API_KEY=freebuff-default-key`
+     to guarantee that double-clicking launcher scripts always passes authentication.
