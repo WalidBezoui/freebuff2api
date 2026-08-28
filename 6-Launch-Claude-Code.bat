@@ -1,6 +1,7 @@
 @echo off
 title Claude Code (Freebuff)
 cd /d "%~dp0"
+if "%FREEBUFF_API_KEY%"=="" set FREEBUFF_API_KEY=freebuff-default-key
 echo ====================================================
 echo             Claude Code - Powered by Freebuff
 echo ====================================================

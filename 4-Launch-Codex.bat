@@ -1,6 +1,7 @@
 @echo off
 title Codex CLI (DeepSeek V4 Flash)
 cd /d "%~dp0"
+if "%FREEBUFF_API_KEY%"=="" set FREEBUFF_API_KEY=freebuff-default-key
 echo ====================================================
 echo    Codex CLI - Powered by DeepSeek V4 Flash
 echo ====================================================
