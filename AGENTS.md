@@ -29,7 +29,7 @@ This document contains critical architectural context, upstream quota constraint
 ## 2. Testing Guidelines for AI Agents (CRITICAL)
 
 ### Rule 1: Always Run Offline Mock Tests (`npm test`)
-- Run `npm test` (`node --check worker.js` + `scripts/test-tools.mjs` + `scripts/test-codex-replay.mjs` + `scripts/test-security.mjs` + fixture pre-check).
+- Run `npm test` (`node --check worker.js` + `scripts/check-fixtures.mjs` + `scripts/test-tools.mjs` + `scripts/test-codex-replay.mjs` + `scripts/test-security.mjs` + fixture pre-check).
 - `npm test` runs **200+ tests completely offline** against local mock fixtures in a few seconds. Count grows as tests are added — never treat the number as fixed; run the suite, don't count it.
 - It tests tool parsing, DSML extraction, V8 isolate wrapping, error propagation, Claude Code compatibility, all 11 committed Codex capture fixtures, auth fail-closed, input caps, and body/healthz scrubbing without consuming any upstream quota.
 
@@ -61,8 +61,8 @@ This document contains critical architectural context, upstream quota constraint
    - `[DONE]` must always be emitted **last** after all synthesized tool calls, finish reasons, and usage metrics.
    - Mid-stream upstream errors must emit `response.failed` and an error chunk, never faking a successful `completed` response. This also applies to the **non-sanitize** chat path (error chunk must precede `[DONE]`).
 6. **Input Caps (`readJsonBody`/`bodyCapsViolation`)**:
-   - Body ≤1MiB (else `413`), messages/input ≤256, tools ≤32, image payload ≤5MiB (else `400`).
-   - Unknown models return `400 unsupported_model` — never silently fall back to `DEFAULT_MODEL`.
+   - Body ≤10MiB (else `413`), messages/input ≤4096 (else `400`), tools ≤128, image payload ≤10MiB (else `400`).
+   - Caps must NEVER be set to low artificial numbers (e.g. 256 messages) which break long agent trajectories, multi-step tool sessions, and Codex compaction. Overrides available via env: `FREEBUFF_MAX_BODY_BYTES`, `FREEBUFF_MAX_MESSAGES`, `FREEBUFF_MAX_TOOLS`.
 7. **Session Hygiene**:
    - `createSession` dedups in-flight creations per isolate (`pendingSessions`); never DELETE another model's active session on GET-reuse (supersede naturally instead).
    - Session recovery (empty stream / stale 428-409-502) must also invalidate `runCache` — run_id is bound to the session.

@@ -2,14 +2,14 @@ const CODEBUFF_API = "https://www.codebuff.com";
 // 可被 env.CODEBUFF_API 覆盖的中继地址（fetch 入口每次请求时同步；默认直连官方）
 let activeCodebuffApi = CODEBUFF_API;
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
-const VERSION = "1.9.5";
+const VERSION = "1.9.6";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 输入保护（安全加固）：限制畸形/超大请求，防止不必要地消耗上游额度
-const MAX_BODY_BYTES = 1024 * 1024; // 请求体上限 1MiB
-const MAX_MESSAGES = 256;           // 单请求消息条数上限
-const MAX_TOOLS = 32;               // 单请求工具声明上限
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 单请求图片负载上限 5MiB
+let maxBodyBytes = 10 * 1024 * 1024; // 请求体上限 10MiB（适应复杂长会话、大文件/diff 与 compaction）
+let maxMessages = 4096;              // 单请求消息/input条数上限 4096（保证 Codex/Claude 长流程轨迹与自动压缩不中断）
+let maxTools = 128;                  // 单请求工具声明上限 128
+let maxImageBytes = 10 * 1024 * 1024; // 单请求图片负载上限 10MiB
 
 // 动态模型注册表：从官方 freebuff 镜像拉取模型清单
 // 真源: https://github.com/CodebuffAI/freebuff (freebuff-private 的 public 镜像)
@@ -408,6 +408,31 @@ export default {
       maxToolOutput = Number.isFinite(v) && v >= 0 ? Math.floor(v) : 32768;
     } else {
       maxToolOutput = 32768;
+    }
+    // 同步输入保护上限（支持环境变量覆盖；默认 10MiB / 4096 消息 / 128 工具）
+    if (env && env.FREEBUFF_MAX_BODY_BYTES) {
+      const v = Number(env.FREEBUFF_MAX_BODY_BYTES);
+      maxBodyBytes = Number.isFinite(v) && v > 0 ? Math.floor(v) : 10 * 1024 * 1024;
+    } else {
+      maxBodyBytes = 10 * 1024 * 1024;
+    }
+    if (env && env.FREEBUFF_MAX_MESSAGES) {
+      const v = Number(env.FREEBUFF_MAX_MESSAGES);
+      maxMessages = Number.isFinite(v) && v > 0 ? Math.floor(v) : 4096;
+    } else {
+      maxMessages = 4096;
+    }
+    if (env && env.FREEBUFF_MAX_TOOLS) {
+      const v = Number(env.FREEBUFF_MAX_TOOLS);
+      maxTools = Number.isFinite(v) && v > 0 ? Math.floor(v) : 128;
+    } else {
+      maxTools = 128;
+    }
+    if (env && env.FREEBUFF_MAX_IMAGE_BYTES) {
+      const v = Number(env.FREEBUFF_MAX_IMAGE_BYTES);
+      maxImageBytes = Number.isFinite(v) && v > 0 ? Math.floor(v) : 10 * 1024 * 1024;
+    } else {
+      maxImageBytes = 10 * 1024 * 1024;
     }
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
@@ -1403,14 +1428,14 @@ async function resolveModelConfig(modelId) {
   return null;
 }
 
-// 带体积上限的 JSON 请求体读取（body 上限 1MiB，超限 413）
+// 带体积上限的 JSON 请求体读取（body 上限 10MiB，超限 413）
 async function readJsonBody(request) {
   let text;
   try { text = await request.text(); } catch { return { error: jsonResponse({ error: { message: "Invalid request body", type: "parse_error" } }, 400) }; }
   // 按 UTF-8 字节数而非字符数校验（多字节字符时 text.length 会低估真实体积）；
   // TextEncoder 是 Web 标准 API，Cloudflare Workers 与 Node 均可用（不用 Buffer）。
-  if (new TextEncoder().encode(text).byteLength > MAX_BODY_BYTES) {
-    return { error: jsonResponse({ error: { message: "Request body too large (limit " + MAX_BODY_BYTES + " bytes)", type: "invalid_request_error" } }, 413) };
+  if (new TextEncoder().encode(text).byteLength > maxBodyBytes) {
+    return { error: jsonResponse({ error: { message: "Request body too large (limit " + maxBodyBytes + " bytes)", type: "invalid_request_error" } }, 413) };
   }
   let params;
   try { params = JSON.parse(text); } catch { return { error: jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400) }; }
@@ -1422,10 +1447,10 @@ async function readJsonBody(request) {
 function bodyCapsViolation(params) {
   const messages = Array.isArray(params.messages) ? params.messages : [];
   const input = Array.isArray(params.input) ? params.input : [];
-  if (messages.length > MAX_MESSAGES) return "messages exceeds limit of " + MAX_MESSAGES;
-  if (input.length > MAX_MESSAGES) return "input exceeds limit of " + MAX_MESSAGES;
+  if (messages.length > maxMessages) return "messages exceeds limit of " + maxMessages;
+  if (input.length > maxMessages) return "input exceeds limit of " + maxMessages;
   const tools = Array.isArray(params.tools) ? params.tools : [];
-  if (tools.length > MAX_TOOLS) return "tools exceeds limit of " + MAX_TOOLS;
+  if (tools.length > maxTools) return "tools exceeds limit of " + maxTools;
   let imageBytes = 0;
   const scanContent = (content) => {
     if (!Array.isArray(content)) return;
@@ -1446,7 +1471,7 @@ function bodyCapsViolation(params) {
   for (const it of input) {
     if (it && typeof it === "object" && Array.isArray(it.content)) scanContent(it.content);
   }
-  if (imageBytes > MAX_IMAGE_BYTES) return "image payload exceeds limit of " + MAX_IMAGE_BYTES + " bytes";
+  if (imageBytes > maxImageBytes) return "image payload exceeds limit of " + maxImageBytes + " bytes";
   return null;
 }
 

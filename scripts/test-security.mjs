@@ -57,31 +57,38 @@ const authHdr = (h) => new Headers({ "Content-Type": "application/json", ...h })
 const mkReq = (body, headers) => new Request("https://localhost/v1/chat/completions", { method: "POST", headers: authHdr({ ...AUTH, ...(headers || {}) }), body: JSON.stringify(body) });
 
 {
-  const big = "x".repeat(1024 * 1024 + 10);
+  const big = "x".repeat(10 * 1024 * 1024 + 10);
   const res = await worker.fetch(mkReq({ model: "deepseek/deepseek-v4-flash", messages: [{ role: "user", content: big }] }), ENV);
-  check("S2 body > 1MiB -> 413", res.status === 413, "status=" + res.status);
+  check("S2 body > 10MiB -> 413", res.status === 413, "status=" + res.status);
 }
 
 {
   const messages = [];
-  for (let i = 0; i < 300; i++) messages.push({ role: "user", content: "m" + i });
+  for (let i = 0; i < 4200; i++) messages.push({ role: "user", content: "m" + i });
   const res = await worker.fetch(mkReq({ model: "deepseek/deepseek-v4-flash", messages }), ENV);
-  check("S2 messages > 256 -> 400", res.status === 400, "status=" + res.status);
+  check("S2 messages > 4096 -> 400", res.status === 400, "status=" + res.status);
   const j = await res.json();
   check("S2 messages error message mentions limit", /messages exceeds limit/.test(j?.error?.message || ""), JSON.stringify(j).slice(0, 120));
 }
 
 {
-  const tools = [];
-  for (let i = 0; i < 40; i++) tools.push({ type: "function", function: { name: "t" + i, parameters: { type: "object", properties: {} } } });
-  const res = await worker.fetch(mkReq({ model: "deepseek/deepseek-v4-flash", messages: [{ role: "user", content: "hi" }], tools }), ENV);
-  check("S2 tools > 32 -> 400", res.status === 400, "status=" + res.status);
+  // 验证中长会话（300 条消息，此前被 256 限制打断）现在完全通过
+  const messages = [];
+  for (let i = 0; i < 300; i++) messages.push({ role: "user", content: "m" + i });
+  const res = await worker.fetch(mkReq({ model: "deepseek/deepseek-v4-flash", messages }), ENV);
+  check("S2 mid-length 300 messages passes caps (not 400)", res.status === 200 || res.status === 502, "status=" + res.status);
 }
 
 {
-  const bigImg = "A".repeat(5 * 1024 * 1024 + 100);
+  const tools = [];
+  for (let i = 0; i < 140; i++) tools.push({ type: "function", function: { name: "t" + i, parameters: { type: "object", properties: {} } } });
+  const res = await worker.fetch(mkReq({ model: "deepseek/deepseek-v4-flash", messages: [{ role: "user", content: "hi" }], tools }), ENV);
+  check("S2 tools > 128 -> 400", res.status === 400, "status=" + res.status);
+}
+
+{
+  const bigImg = "A".repeat(10 * 1024 * 1024 + 100);
   const res = await worker.fetch(mkReq({ model: "deepseek/deepseek-v4-flash", messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64," + bigImg } }] }] }), ENV);
-  // 5MiB+ base64 图片必然使整体请求体 > 1MiB → 先被 body cap(413) 拦截；两种拒绝方式都正确
   check("S2 oversized image rejected (400 or 413)", res.status === 400 || res.status === 413, "status=" + res.status);
 }
 
@@ -134,15 +141,15 @@ const mkAnthReq = (path, body) => new Request("https://localhost" + path, { meth
 // ---------- S2-anth: count_tokens 补全请求结构上限（此前无任何 caps） ----------
 {
   const messages = [];
-  for (let i = 0; i < 300; i++) messages.push({ role: "user", content: "m" + i });
+  for (let i = 0; i < 4200; i++) messages.push({ role: "user", content: "m" + i });
   const res = await worker.fetch(mkAnthReq("/v1/messages/count_tokens", { model: "mimo/mimo-v2.5", messages }), ENV);
-  check("S2-anthropic count_tokens messages > 256 -> 400", res.status === 400, "status=" + res.status);
+  check("S2-anthropic count_tokens messages > 4096 -> 400", res.status === 400, "status=" + res.status);
 }
 
 {
-  const big = "x".repeat(1024 * 1024 + 10);
+  const big = "x".repeat(10 * 1024 * 1024 + 10);
   const res = await worker.fetch(mkAnthReq("/v1/messages/count_tokens", { model: "mimo/mimo-v2.5", messages: [{ role: "user", content: big }] }), ENV);
-  check("S2-anthropic count_tokens body > 1MiB -> 413", res.status === 413, "status=" + res.status);
+  check("S2-anthropic count_tokens body > 10MiB -> 413", res.status === 413, "status=" + res.status);
 }
 
 // ---------- S4: healthz scrubs token prefixes ----------
