@@ -1,8 +1,8 @@
 services:
-  freebuff2api:
+  freebuff-api:
     build: .
-    image: freebuff2api:1.9.5
-    container_name: freebuff2api
+    image: freebuff-api:1.9.5
+    container_name: freebuff-api
     restart: unless-stopped
     ports:
       - "8877:8787"

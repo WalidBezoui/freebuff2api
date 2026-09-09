@@ -2,14 +2,14 @@ import { createServer } from 'node:http';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadDotEnv } from './load-env.mjs';
+import { loadDotEnv } from '../load-env.mjs';
 
 loadDotEnv();
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const __dirname = dirname(dirname(fileURLToPath(import.meta.url)));
 
 // Load worker module
-const worker = await import('./worker.js');
+const worker = await import('../worker.js');
 const handler = worker.default;
 
 // === Build env from config ===
@@ -88,10 +88,10 @@ const server = createServer(async (nodeReq, nodeRes) => {
   const onClose = () => { try { abortCtrl.abort(new Error("client disconnect")); } catch {} };
   nodeRes.on("close", onClose);
   try {
-    // Body 读取带上限：超 1MiB 直接 413，避免 Buffer.concat OOM（worker 也会二次校验）
+    // Body 读取带上限：超 10MiB 直接 413，避免 Buffer.concat OOM（worker 也会二次校验）
     const chunks = [];
     let total = 0;
-    const MAX_BODY = 1024 * 1024;
+    const MAX_BODY = 10 * 1024 * 1024;
     for await (const chunk of nodeReq) {
       total += chunk.length;
       if (total > MAX_BODY) {

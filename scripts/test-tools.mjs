@@ -1037,6 +1037,111 @@ async function readRawSSE(res) {
   check("T44 Anthropic tool_result capped (marker present)", !!toolMsg && toolMsg.content.includes("truncated by freebuff2api"), JSON.stringify(toolMsg).slice(0, 120));
 }
 
+// ---------- T45: 空/非法 arguments 自动修复为合法 JSON object 字符串 ----------
+{
+  currentStream = [{ id: "cmpl", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { content: "repaired" }, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 } }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL,
+      input: [
+        { type: "function_call", id: "call_empty", name: "exec", arguments: "" },
+        { type: "function_call_output", call_id: "call_empty", output: "done" },
+      ],
+    }),
+  });
+  await worker.fetch(req, ENV);
+  const up = upstreamChatBodies[upstreamChatBodies.length - 1];
+  const asstMsg = (up?.body?.messages || []).find((m) => m.role === "assistant" && Array.isArray(m.tool_calls));
+  const tc = asstMsg?.tool_calls?.[0];
+  check("T45 empty arguments repaired to {}", !!tc && tc.function.arguments === "{}", JSON.stringify(tc).slice(0, 120));
+  let parsedJson = null;
+  try { parsedJson = JSON.parse(tc.function.arguments); } catch {}
+  check("T45 arguments is valid JSON object", parsedJson !== null && typeof parsedJson === "object" && !Array.isArray(parsedJson), JSON.stringify(tc).slice(0, 120));
+}
+
+// ---------- T46: write_file (small) translated to exec with base64 node script ----------
+{
+  const filePath = "src/hello.js";
+  const fileContent = "console.log('hello world');";
+  currentStream = [
+    chunk({ tool_calls: [{ index: 0, id: "call_w1", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: filePath, content: fileContent }) } }] }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "write file" }], tools: execTools, stream: true }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const completed = events.find((e) => e.type === "response.completed");
+  const tool = (completed?.response?.output || []).find((o) => o.type === "custom_tool_call");
+  check("T46 write_file mapped to exec", tool?.name === "exec", JSON.stringify(tool));
+  check("T46 write_file uses base64 node writer", tool?.input?.includes("Buffer.from") && tool?.input?.includes("writeFileSync"), tool?.input);
+  check("T46 write_file contains b64 encoded path", tool?.input?.includes(Buffer.from(filePath).toString("base64")), tool?.input);
+}
+
+// ---------- T47: write_file (large > 4000 b64 chars) translated to multi-chunk exec ----------
+{
+  const filePath = "large.txt";
+  const fileContent = "X".repeat(5000);
+  currentStream = [
+    chunk({ tool_calls: [{ index: 0, id: "call_w2", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: filePath, content: fileContent }) } }] }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "write large file" }], tools: execTools, stream: true }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const completed = events.find((e) => e.type === "response.completed");
+  const tool = (completed?.response?.output || []).find((o) => o.type === "custom_tool_call");
+  check("T47 large write_file mapped to exec", tool?.name === "exec", JSON.stringify(tool));
+  check("T47 large write_file is chunked", tool?.input?.includes("chunks =") && tool?.input?.includes("appendFileSync"), tool?.input);
+}
+
+// ---------- T48: read_file translated to exec with atomic node read ----------
+{
+  const filePath = "package.json";
+  currentStream = [
+    chunk({ tool_calls: [{ index: 0, id: "call_r1", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: filePath }) } }] }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "read file" }], tools: execTools, stream: true }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const events = await readSSE(res);
+  const completed = events.find((e) => e.type === "response.completed");
+  const tool = (completed?.response?.output || []).find((o) => o.type === "custom_tool_call");
+  check("T48 read_file mapped to exec", tool?.name === "exec", JSON.stringify(tool));
+  check("T48 read_file uses readFileSync", tool?.input?.includes("readFileSync") && tool?.input?.includes(Buffer.from(filePath).toString("base64")), tool?.input);
+}
+
+// ---------- T49: upstream chat.tools includes write_file, read_file, apply_patch for Codex ----------
+{
+  currentStream = [{ id: "cmpl-t49", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] }];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "test" }], tools: execTools, stream: false }),
+  });
+  await worker.fetch(req, ENV);
+  const upTools = upstreamChatBodies[0]?.body?.tools || [];
+  const toolNames = upTools.map((t) => t.function?.name);
+  check("T49 upstream has write_file tool", toolNames.includes("write_file"), JSON.stringify(toolNames));
+  check("T49 upstream has read_file tool", toolNames.includes("read_file"), JSON.stringify(toolNames));
+  check("T49 upstream has apply_patch tool", toolNames.includes("apply_patch"), JSON.stringify(toolNames));
+  const wfTool = upTools.find((t) => t.function?.name === "write_file");
+  check("T49 write_file has path and content properties", !!wfTool?.function?.parameters?.properties?.path && !!wfTool?.function?.parameters?.properties?.content, JSON.stringify(wfTool));
+}
+
 clearTimeout(suiteTimer);
 const failed = results.filter((r) => !r.ok);
 console.log("\n=== " + (results.length - failed.length) + "/" + results.length + " passed ===");

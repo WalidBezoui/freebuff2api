@@ -24,7 +24,7 @@ export default async function handler(req, res) {
   try {
     const chunks = [];
     let total = 0;
-    const MAX_BODY = 1024 * 1024;
+    const MAX_BODY = 10 * 1024 * 1024;
     for await (const chunk of req) {
       total += chunk.length;
       if (total > MAX_BODY) {
@@ -43,7 +43,8 @@ export default async function handler(req, res) {
   }
 
   const host = req.headers.host || 'localhost';
-  const url = `https://${host}${req.url}`;
+  const rawUrl = req.url || '/';
+  const url = `https://${host}${rawUrl}`;
   const request = new Request(url, {
     method: req.method,
     headers: new Headers(req.headers),
@@ -53,7 +54,12 @@ export default async function handler(req, res) {
 
   try {
     const response = await handlerFunc(request, env);
-    res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
+    const respHeaders = Object.fromEntries(response.headers.entries());
+    if (respHeaders['content-type'] && respHeaders['content-type'].includes('text/event-stream')) {
+      respHeaders['x-accel-buffering'] = 'no';
+      respHeaders['cache-control'] = 'no-cache, no-transform';
+    }
+    res.writeHead(response.status, respHeaders);
     if (response.body) {
       const reader = response.body.getReader();
       try {

@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: freebuff2api
+    name: freebuff-api
     env: node
     region: oregon # US West (Oregon) - Free US Egress
     plan: free

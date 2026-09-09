@@ -45,3 +45,4 @@ freebuff_tools/test_extract_freebuff_quota.py
 
 # local debug scratch files
 scratch/
+.vercel

@@ -9,5 +9,5 @@ echo API Key : (set FREEBUFF_API_KEY in .env — required since v1.9.2, no defau
 echo Health  : http://localhost:8787/healthz
 echo ====================================================
 echo.
-node server.js
+node scripts/server.mjs
 pause

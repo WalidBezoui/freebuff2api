@@ -332,17 +332,24 @@ function modelPoolCategory(modelId) {
 // 这里保留内置 ID 仅为兼容旧配置（请求会尝试建 session，上游拒绝则回传真实上游错误）。
 // 当前权威模型清单以动态源（freebuff-models.json / MODELS.md）为准。
 const MODELS = [
-  { id: "mimo/mimo-v2.5", session: "mimo/mimo-v2.5", agent: "base2-free-mimo", upstream: "mimo/mimo-v2.5" },
-  { id: "deepseek/deepseek-v4-flash", session: "deepseek/deepseek-v4-flash", agent: "base2-free-deepseek-flash", upstream: "deepseek/deepseek-v4-flash" },
-  { id: "deepseek/deepseek-v4-pro", session: "deepseek/deepseek-v4-pro", agent: "base2-free-deepseek", upstream: "deepseek/deepseek-v4-pro" },
-  { id: "openai/gpt-5.6-luna", session: "openai/gpt-5.6-luna", agent: "base2-free-luna", upstream: "openai/gpt-5.6-luna" },
-  { id: "minimax/minimax-m3", session: "minimax/minimax-m3", agent: "base2-free-minimax-m3", upstream: "minimax/minimax-m3" },
-  { id: "z-ai/glm-5.2", session: "z-ai/glm-5.2", agent: "base2-free-glm", upstream: "z-ai/glm-5.2" },
+  { id: "mimo/mimo-v2.5", session: "mimo/mimo-v2.5", agent: "base3-free-mimo", upstream: "mimo/mimo-v2.5" },
+  { id: "deepseek/deepseek-v4-flash", session: "deepseek/deepseek-v4-flash", agent: "base3-free-deepseek-flash", upstream: "deepseek/deepseek-v4-flash" },
+  { id: "deepseek/deepseek-v4-pro", session: "deepseek/deepseek-v4-pro", agent: "base3-free-deepseek", upstream: "deepseek/deepseek-v4-pro" },
+  { id: "openai/gpt-5.6-luna", session: "openai/gpt-5.6-luna", agent: "base3-free-luna", upstream: "openai/gpt-5.6-luna" },
+  { id: "minimax/minimax-m3", session: "minimax/minimax-m3", agent: "base3-free-minimax-m3", upstream: "minimax/minimax-m3" },
+  { id: "z-ai/glm-5.3-flash", session: "z-ai/glm-5.3-flash", agent: "base3-free-glm-5-3-flash", upstream: "z-ai/glm-5.3-flash" },
+  { id: "glm-5.3-flash", session: "z-ai/glm-5.3-flash", agent: "base3-free-glm-5-3-flash", upstream: "z-ai/glm-5.3-flash" },
+  { id: "z-ai/glm-5.2", session: "z-ai/glm-5.3-flash", agent: "base3-free-glm-5-3-flash", upstream: "z-ai/glm-5.3-flash" },
+  { id: "glm-5.2", session: "z-ai/glm-5.3-flash", agent: "base3-free-glm-5-3-flash", upstream: "z-ai/glm-5.3-flash" },
   { id: "poolside/laguna-s-2.1", session: "poolside/laguna-s-2.1", agent: "base2-free-laguna-s-2-1", upstream: "poolside/laguna-s-2.1" },
   { id: "openrouter/poolside/laguna-s-2.1", session: "openrouter/poolside/laguna-s-2.1", agent: "base2-free-laguna-s-2-1-openrouter", upstream: "openrouter/poolside/laguna-s-2.1" },
   { id: "crof/kimi-k3-eco", session: "crof/kimi-k3-eco", agent: "base2-free-kimi-k3-eco", upstream: "crof/kimi-k3-eco" },
   { id: "anthropic/claude-fable-5", session: "anthropic/claude-fable-5", agent: "base2-free-fable", upstream: "anthropic/claude-fable-5" },
-  { id: "meta/muse-spark-1.2-contributor", session: "meta/muse-spark-1.2-contributor", agent: "base2-free-muse-spark", upstream: "meta/muse-spark-1.2-contributor" },
+  { id: "meta/muse-spark-1.2-contributor", session: "meta/muse-spark-1.2-contributor", agent: "base3-free-muse-spark", upstream: "meta/muse-spark-1.2-contributor" },
+  { id: "meta/muse-spark-1.3-contributor", session: "meta/muse-spark-1.3-contributor", agent: "base3-free-muse-spark-1-3", upstream: "meta/muse-spark-1.3-contributor" },
+  { id: "meta/muse-spark-1.3", session: "meta/muse-spark-1.3-contributor", agent: "base3-free-muse-spark-1-3", upstream: "meta/muse-spark-1.3-contributor" },
+  { id: "musespark-1.3", session: "meta/muse-spark-1.3-contributor", agent: "base3-free-muse-spark-1-3", upstream: "meta/muse-spark-1.3-contributor" },
+  { id: "muse-spark-1.3", session: "meta/muse-spark-1.3-contributor", agent: "base3-free-muse-spark-1-3", upstream: "meta/muse-spark-1.3-contributor" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -376,6 +383,10 @@ const PREMIUM_QUOTA_MODELS = new Set([
   "openai/gpt-5.6-luna",
   "minimax/minimax-m3",
   "meta/muse-spark-1.2-contributor",
+  "meta/muse-spark-1.3-contributor",
+  "meta/muse-spark-1.3",
+  "musespark-1.3",
+  "muse-spark-1.3",
 ]);
 const STANDARD_MODELS = new Set([
   "deepseek/deepseek-v4-flash",
@@ -434,10 +445,11 @@ export default {
     } else {
       maxImageBytes = 10 * 1024 * 1024;
     }
+    const pathname = url.pathname.replace(/^\/api(?=\/|$)/, "") || "/";
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
-    if (request.method === "GET" && url.pathname === "/healthz") {
+    if (request.method === "GET" && (pathname === "/healthz" || pathname === "/")) {
       // 健康检查只读 Worker 最近一次真实请求形成的本地快照。
       // 不因为公开探针访问就向上游 fan-out GET /session 和 /me；这类请求
       // 会产生额外行为，也可能干扰同一账号正在进行的会话。
@@ -458,7 +470,7 @@ export default {
       const hint = !configured
         ? "Server misconfigured: FREEBUFF_API_KEY is not set. Set it in Vercel Dashboard → Settings → Environment Variables (Production + Preview) and redeploy. Local: set FREEBUFF_API_KEY in .env (see .env.example)."
         : "Invalid API key — ensure client sends Authorization: Bearer <FREEBUFF_API_KEY> or x-api-key header matching Vercel's FREEBUFF_API_KEY.";
-      if (url.pathname === "/v1/messages" || url.pathname === "/messages" || url.pathname === "/v1/messages/count_tokens" || url.pathname === "/messages/count_tokens") {
+      if (pathname === "/v1/messages" || pathname === "/messages" || pathname === "/v1/messages/count_tokens" || pathname === "/messages/count_tokens") {
         return anthropicError(hint, "authentication_error", 401);
       }
       return jsonResponse({ error: { message: hint, type: "auth_error" } }, 401);
@@ -466,19 +478,19 @@ export default {
 
     cleanCache();
 
-    if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
+    if (request.method === "GET" && (pathname === "/v1/models" || pathname === "/models")) {
       return await handleModels();
     }
-    if (request.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
+    if (request.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/chat/completions")) {
       return handleChat(request, env);
     }
-    if (request.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
+    if (request.method === "POST" && (pathname === "/v1/responses" || pathname === "/responses")) {
       return handleResponses(request, env);
     }
-    if (request.method === "POST" && (url.pathname === "/v1/messages/count_tokens" || url.pathname === "/messages/count_tokens")) {
+    if (request.method === "POST" && (pathname === "/v1/messages/count_tokens" || pathname === "/messages/count_tokens")) {
       return handleAnthropicCountTokens(request, env);
     }
-    if (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages")) {
+    if (request.method === "POST" && (pathname === "/v1/messages" || pathname === "/messages")) {
       return handleAnthropicMessages(request, env);
     }
     return jsonResponse({ error: { message: "Not found", type: "not_found" } }, 404);
@@ -1201,6 +1213,31 @@ const UPSTREAM_KEYS = [
 // 前缀绕过已被官方修补并返回 403 free_mode_cli_required）。
 const BUFFY = "You are Buffy, the strategic coding assistant.";
 
+function ensureValidJsonArguments(args) {
+  if (args === undefined || args === null) return "{}";
+  if (typeof args === "object") {
+    if (Array.isArray(args)) return JSON.stringify({ items: args });
+    return JSON.stringify(args);
+  }
+  if (typeof args !== "string") {
+    return JSON.stringify({ value: args });
+  }
+  const trimmed = args.trim();
+  if (!trimmed) return "{}";
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      return trimmed;
+    }
+    if (typeof parsed === "object" && parsed !== null && Array.isArray(parsed)) {
+      return JSON.stringify({ items: parsed });
+    }
+    return JSON.stringify({ value: parsed });
+  } catch {
+    return JSON.stringify({ command: trimmed });
+  }
+}
+
 function normalizeMessages(messages) {
   if (!Array.isArray(messages)) return [];
   const out = [];
@@ -1226,6 +1263,23 @@ function normalizeMessages(messages) {
         }
       }
     }
+    // 净化与校验所有 assistant tool_calls，确保 arguments 必为合法 JSON object 字符串
+    if (Array.isArray(item.tool_calls) && item.tool_calls.length > 0) {
+      item.tool_calls = item.tool_calls.map((tc) => {
+        if (!tc || typeof tc !== "object") return tc;
+        const fn = tc.function || {};
+        return {
+          ...tc,
+          id: tc.id || genId("call_"),
+          type: "function",
+          function: {
+            ...fn,
+            name: fn.name || "exec_command",
+            arguments: ensureValidJsonArguments(fn.arguments),
+          },
+        };
+      });
+    }
     out.push(item);
   }
   if (!hasSystem) out.unshift({ role: "system", content: BUFFY, cache_control: { type: "ephemeral" } });
@@ -1250,6 +1304,9 @@ const MODEL_EFFORTS = {
   "deepseek/deepseek-v4-pro": ["high", "max"],
   "openai/gpt-5.6-luna": ["high"],
   "meta/muse-spark-1.2-contributor": ["low", "medium", "high", "xhigh"],
+  "meta/muse-spark-1.3-contributor": ["low", "medium", "high", "xhigh"],
+  "meta/muse-spark-1.3": ["low", "medium", "high", "xhigh"],
+  "musespark-1.3": ["low", "medium", "high", "xhigh"],
 };
 
 function clampReasoningEffort(requested, allowed) {
@@ -1517,18 +1574,61 @@ function responsesToChatParams(params, mc) {
     if (!t || typeof t !== "object") return null;
     const rawName = t.name || (t.type === "custom" || t.type === "local_shell" ? "exec_command" : "");
     const name = rawName === "exec" ? "exec_command" : (rawName || "exec_command");
-    const desc = t.description || "Execute a shell command";
-    const paramsSchema = {
-      type: "object",
-      properties: {
-        cmd: { type: "string", description: "The command to execute" },
-        command: { type: "string", description: "The command to execute" }
-      },
-      required: ["cmd"]
-    };
+    let desc = t.description;
+    let paramsSchema = t.parameters || t.input_schema || t.function?.parameters;
+    if (!paramsSchema || typeof paramsSchema !== "object") {
+      if (name === "write_file") {
+        desc = desc || "Write or overwrite a complete file with utf-8 text content atomically. Prefer this whenever creating new files or completely rewriting existing files.";
+        paramsSchema = {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Path to the file to write" },
+            content: { type: "string", description: "The full text content to write to the file" }
+          },
+          required: ["path", "content"]
+        };
+      } else if (name === "read_file") {
+        desc = desc || "Read the complete content of a file";
+        paramsSchema = {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Path to the file to read" }
+          },
+          required: ["path"]
+        };
+      } else if (name === "apply_patch") {
+        desc = desc || "Apply a surgical unified diff or context patch to an existing file";
+        paramsSchema = {
+          type: "object",
+          properties: {
+            patch: { type: "string", description: "The patch content in unified diff or context format" }
+          },
+          required: ["patch"]
+        };
+      } else if (name === "web_search") {
+        desc = desc || "Search the web for real-time information";
+        paramsSchema = {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "The search query" }
+          },
+          required: ["query"]
+        };
+      } else {
+        desc = desc || "Execute a shell command";
+        paramsSchema = {
+          type: "object",
+          properties: {
+            cmd: { type: "string", description: "The command to execute" },
+            command: { type: "string", description: "The command to execute" }
+          },
+          required: ["cmd"]
+        };
+      }
+    }
     return {
       type: "function",
-      function: { name, description: desc, parameters: paramsSchema },
+      function: { name, description: desc || "Tool", parameters: paramsSchema },
     };
   };
   if (Array.isArray(params.tools)) {
@@ -1577,11 +1677,34 @@ function responsesToChatParams(params, mc) {
     chat.tools = merged;
   }
 
-  // 无任何工具时：Codex 类客户端（首个回合 tools 为空）注入默认 exec_command schema，
+  // If client supports exec/shell (e.g. Codex), provide write_file, read_file, apply_patch
+  // so the model can write/read files cleanly without PowerShell syntax/escaping bugs.
+  const hasExecInTools = (chat.tools || []).some((t) => t?.function?.name === "exec_command" || t?.function?.name === "shell_command");
+  if (hasExecInTools) {
+    const existingToolNames = new Set((chat.tools || []).map((t) => t.function.name));
+    const helpersToAdd = [
+      mapResponsesTool({ type: "custom", name: "write_file" }),
+      mapResponsesTool({ type: "custom", name: "read_file" }),
+      mapResponsesTool({ type: "custom", name: "apply_patch" }),
+    ];
+    for (const helper of helpersToAdd) {
+      if (helper && !existingToolNames.has(helper.function.name)) {
+        existingToolNames.add(helper.function.name);
+        chat.tools.push(helper);
+      }
+    }
+  }
+
+  // 无任何工具时：Codex 类客户端（首个回合 tools 为空）注入默认 exec_command schema + file tools，
   // 让上游稳定产出可被 sanitize 拦截成 custom_tool_call exec 的调用。
   if (!Array.isArray(chat.tools) || chat.tools.length === 0) {
     if (chatShouldSanitize(chat)) {
-      chat.tools = [mapResponsesTool({ type: "custom", name: "exec", description: "Execute a shell command on the user's machine and return its stdout" })];
+      chat.tools = [
+        mapResponsesTool({ type: "custom", name: "exec", description: "Execute a shell command on the user's machine and return its stdout" }),
+        mapResponsesTool({ type: "custom", name: "write_file" }),
+        mapResponsesTool({ type: "custom", name: "read_file" }),
+        mapResponsesTool({ type: "custom", name: "apply_patch" }),
+      ];
     }
   }
 
@@ -1633,7 +1756,7 @@ function responsesInputToMessages(input, instructions) {
         type: "function",
         function: {
           name: fnName,
-          arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}),
+          arguments: ensureValidJsonArguments(item.arguments),
         },
       };
       const last = messages[messages.length - 1];
@@ -1650,7 +1773,7 @@ function responsesInputToMessages(input, instructions) {
       const callId = item.call_id || item.id || (genId("call_"));
       // 兼容新旧 exec 写法（v0.148: tools.exec_command({cmd}) / v0.147: tools.shell_command({command})）
       let cmdString = extractExecCommandText(item.input);
-      const argsPayload = JSON.stringify({ cmd: cmdString, command: cmdString });
+      const argsPayload = ensureValidJsonArguments({ cmd: cmdString, command: cmdString });
       const tc = {
         id: callId,
         type: "function",
@@ -1985,7 +2108,7 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
           const sanitize = chatShouldSanitize(chatParams);
           pipeUpstreamToClient(resp.body, writable, null, { sanitize, clientTools: chatParams?._clientTools || chatParams?.tools || [], preserveToolNames });
         }
-        return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
+        return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", ...corsHeaders() } });
       }
 
       // 非流式空 200 重试（审计 2.7）：聚合时发现空流（脏 session）→ 与流式路径一致，
@@ -2660,6 +2783,59 @@ function extractExecCommandText(input) {
   return input.trim();
 }
 
+function toBase64(str) {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(str, "utf8").toString("base64");
+  }
+  const bytes = new TextEncoder().encode(str);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function getByteLength(str) {
+  if (typeof Buffer !== "undefined") return Buffer.byteLength(str, "utf8");
+  return new TextEncoder().encode(str).byteLength;
+}
+
+function buildNodeWriteFileScript(filePath, fileContent) {
+  const b64Path = toBase64(filePath);
+  const b64Content = toBase64(fileContent);
+  const byteLen = getByteLength(fileContent);
+
+  if (b64Content.length <= 4000) {
+    const writeCmd = `node -e 'const fs=require(''fs''),p=require(''path'');const f=Buffer.from(process.argv[1],''base64'').toString();const d=Buffer.from(process.argv[2],''base64'');fs.mkdirSync(p.dirname(p.resolve(f)),{recursive:true});fs.writeFileSync(f,d);console.log(''Successfully wrote ''+d.length+'' bytes to ''+f);' "${b64Path}" "${b64Content}"`;
+    return `text(await tools.exec_command({ cmd: ${JSON.stringify(writeCmd)} }));`;
+  }
+
+  const chunks = [];
+  for (let i = 0; i < b64Content.length; i += 4000) {
+    chunks.push(b64Content.slice(i, i + 4000));
+  }
+
+  const nodeInit = "node -e 'const fs=require(''fs''),p=require(''path'');const f=Buffer.from(process.argv[1],''base64'').toString();const d=Buffer.from(process.argv[2],''base64'');fs.mkdirSync(p.dirname(p.resolve(f)),{recursive:true});fs.writeFileSync(f,d);'";
+  const nodeAppend = "node -e 'const fs=require(''fs'');const f=Buffer.from(process.argv[1],''base64'').toString();const d=Buffer.from(process.argv[2],''base64'');fs.appendFileSync(f,d);'";
+
+  return `// @exec: {"yield_time_ms": 30000}
+const chunks = ${JSON.stringify(chunks)};
+const b64Path = ${JSON.stringify(b64Path)};
+for (let i = 0; i < chunks.length; i++) {
+  const cmd = (i === 0 ? ${JSON.stringify(nodeInit)} : ${JSON.stringify(nodeAppend)}) + ' "' + b64Path + '" "' + chunks[i] + '"';
+  const res = await tools.exec_command({ cmd });
+  if (res && res.exit_code && res.exit_code !== 0) {
+    text("Error writing chunk " + i + ": " + (res.output || ""));
+    return;
+  }
+}
+text("Successfully wrote " + ${byteLen} + " bytes to " + ${JSON.stringify(filePath)});`;
+}
+
+function buildNodeReadFileScript(filePath) {
+  const b64Path = toBase64(filePath);
+  const readCmd = `node -e 'const fs=require(''fs'');const f=Buffer.from(process.argv[1],''base64'').toString();try{process.stdout.write(fs.readFileSync(f));}catch(e){console.error(e.message);process.exit(1);}' "${b64Path}"`;
+  return `text(await tools.exec_command({ cmd: ${JSON.stringify(readCmd)} }));`;
+}
+
 // Codex v0.148 exec 沙箱里真实暴露的工具名（实测 ALL_TOOLS 探针输出）：
 // 除这些之外（exec/apply_patch 另有专门处理），客户端没声明的 function_call 一律丢弃。
 const CODEX_NATIVE_TOOLS = new Set([
@@ -2700,6 +2876,40 @@ function sanitizeToolPayload(rawFnName, args, clientTools = [], preserveNames = 
     return { fnName, args: "" };
   }
 
+  if (!preserveNames) {
+    const isWriteFileDeclared = Array.isArray(clientTools) && clientTools.some((t) => {
+      const dn = (t?.name || t?.function?.name || "").toLowerCase();
+      return dn === "write_file";
+    });
+    const isReadFileDeclared = Array.isArray(clientTools) && clientTools.some((t) => {
+      const dn = (t?.name || t?.function?.name || "").toLowerCase();
+      return dn === "read_file";
+    });
+
+    if (n === "write_file") {
+      if (isWriteFileDeclared) {
+        return { fnName: "write_file", args: typeof args === "object" ? args : {} };
+      }
+      const filePath = typeof args?.path === "string" ? args.path : (typeof args?.file === "string" ? args.file : "");
+      const fileContent = typeof args?.content === "string" ? args.content : (typeof args?.body === "string" ? args.body : "");
+      if (!filePath) {
+        return { fnName: "exec", args: `text("Error: write_file missing required 'path' parameter");` };
+      }
+      return { fnName: "exec", args: buildNodeWriteFileScript(filePath, fileContent) };
+    }
+
+    if (n === "read_file") {
+      if (isReadFileDeclared) {
+        return { fnName: "read_file", args: typeof args === "object" ? args : {} };
+      }
+      const filePath = typeof args?.path === "string" ? args.path : (typeof args?.file === "string" ? args.file : "");
+      if (!filePath) {
+        return { fnName: "exec", args: `text("Error: read_file missing required 'path' parameter");` };
+      }
+      return { fnName: "exec", args: buildNodeReadFileScript(filePath) };
+    }
+  }
+
   if (isExecLike) {
     if (hasShellCommand && !hasExec) {
       fnName = "shell_command";
@@ -2708,8 +2918,16 @@ function sanitizeToolPayload(rawFnName, args, clientTools = [], preserveNames = 
     } else {
       fnName = "exec";
     }
-  } else if (n === "patch" || n === "edit_file" || n === "write_file") {
+  } else if (n === "patch") {
     fnName = "apply_patch";
+  } else if (n === "edit_file") {
+    if (typeof args?.patch === "string") {
+      fnName = "apply_patch";
+    } else if (typeof args?.content === "string") {
+      return sanitizeToolPayload("write_file", args, clientTools, rawFnName);
+    } else {
+      fnName = "apply_patch";
+    }
   } else if (n === "search" || n === "google_search" || n === "bing_search") {
     fnName = "web_search";
   }
@@ -3228,6 +3446,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
                   nativeToolItems.set(ti, item);
                 }
                 if (fn.name && !item.name) {
+                  item.rawName = fn.name;
                   item.name = fn.name;
                   if (item.pending) {
                     item.pending = false;
@@ -3386,14 +3605,15 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
       const toolFinalize = async (item) => {
         if (item.kind !== "function_call") return true;
         let cleanArgs = item.args;
+        const targetName = item.rawName || item.name;
         try {
           const rawObj = typeof item.args === "string" ? (item.args.startsWith("{") ? JSON.parse(item.args) : item.args) : (item.args || {});
-          const sanitized = sanitizeToolPayload(item.name, rawObj, clientTools);
+          const sanitized = sanitizeToolPayload(targetName, rawObj, clientTools);
           if (sanitized.drop) return item.started; // 已上屏的项无法回收 → 保留（避免孤儿）；未上屏 → 丢弃
           item.name = sanitized.fnName;
           cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);
         } catch {
-          const sanitized = sanitizeToolPayload(item.name, { command: item.args }, clientTools);
+          const sanitized = sanitizeToolPayload(targetName, { command: item.args }, clientTools);
           if (sanitized.drop) return item.started;
           item.name = sanitized.fnName;
           cleanArgs = typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args);

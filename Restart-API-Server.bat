@@ -13,5 +13,5 @@ timeout /t 1 /nobreak >nul
 
 echo Starting fresh server on http://localhost:8787/v1 ...
 echo.
-node server.js
+node scripts/server.mjs
 pause
