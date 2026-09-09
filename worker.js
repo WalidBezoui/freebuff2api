@@ -2,7 +2,7 @@ const CODEBUFF_API = "https://www.codebuff.com";
 // 可被 env.CODEBUFF_API 覆盖的中继地址（fetch 入口每次请求时同步；默认直连官方）
 let activeCodebuffApi = CODEBUFF_API;
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
-const VERSION = "1.9.6";
+const VERSION = "1.9.7";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 输入保护（安全加固）：限制畸形/超大请求，防止不必要地消耗上游额度
