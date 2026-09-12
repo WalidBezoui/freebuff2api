@@ -164,7 +164,12 @@ docker compose up -d --build
 | `PORT` / `HOST` | 监听端口/地址，默认 `8787` / `0.0.0.0` |
 | `FREEBUFF_API_KEY` | 本 API 访问 key。**必填**：未配置时所有请求返回 401（不设默认密钥后门） |
 | `FREEBUFF_MAX_TOOL_OUTPUT` | 工具（exec/Bash）结果回传上游前的最大长度（字符），`0`=不限，缺省 `32768`；防止长会话上下文被巨型输出撑爆 |
-| `FREEBUFF_DEBUG` | `true` 开启请求级调试日志 |
+| `FREEBUFF_DEBUG` | `true` 开启请求级调试日志（含 `[effort]` / `[loop]` 诊断行） |
+| `FREEBUFF_DEFAULT_EFFORT` | DeepSeek 无 effort 请求时的默认推理档，缺省 `max`；显式 effort 优先 |
+| `FREEBUFF_BASH_FALLBACK` | `0` 关闭：DSML/XML 全失败时把单个 ```` ```bash ```` 块当 `exec` 的回退（缺省开） |
+| `FREEBUFF_MAX_READ_FILE_BYTES` | `read_file` 单文件体积上限（字节），`0`=不限，缺省 `524288` |
+| `FREEBUFF_DEEPSEEK_HINTS` | `0` 关闭：DeepSeek 工具会话自动注入工具引导 system 提示（缺省开） |
+| `FREEBUFF_LOOP_NUDGE` / `FREEBUFF_LOOP_THRESHOLD` | 同命令连续失败达阈值（缺省 `3`）时在 tool 结果尾注记一次，打破裸重试循环；`0` 关闭注记（非零 exit code 恒透传） |
 
 > ⚠️ 容器内 `credentials/` 以只读方式挂载；`server.js` 启动时读取并组装 `FREEBUFF_TOKEN`（多账号逗号分隔）。
 

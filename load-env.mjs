@@ -50,3 +50,40 @@ export function loadDotEnv(env = process.env) {
   } catch {}
   return env;
 }
+
+// worker Env 透传表（P10）：worker.fetch 从 env 读取的所有键必须在此列出，
+// 否则 Vercel Dashboard / 本地 .env 的配置会被入口静默丢弃。
+// 新增 worker env 读取时同步加到这里；scripts/check-env.mjs 做漂移检查。
+const WORKER_ENV_KEYS = [
+  "FREEBUFF_TOKEN",
+  "FREEBUFF_API_KEY",
+  "FREEBUFF_DEBUG",
+  "CODEBUFF_API",
+  "RELAY_KEY",
+  "FREEBUFF_MAX_TOOL_OUTPUT",
+  "FREEBUFF_MAX_BODY_BYTES",
+  "FREEBUFF_MAX_MESSAGES",
+  "FREEBUFF_MAX_TOOLS",
+  "FREEBUFF_MAX_IMAGE_BYTES",
+  "FREEBUFF_DEFAULT_EFFORT",
+  "FREEBUFF_BASH_FALLBACK",
+  "FREEBUFF_MAX_READ_FILE_BYTES",
+  "FREEBUFF_DEEPSEEK_HINTS",
+  "FREEBUFF_LOOP_NUDGE",
+  "FREEBUFF_LOOP_THRESHOLD",
+];
+
+export function workerEnvKeys() {
+  return [...WORKER_ENV_KEYS];
+}
+
+export function buildWorkerEnv(source = process.env) {
+  const env = {};
+  for (const k of WORKER_ENV_KEYS) {
+    const v = source ? source[k] : undefined;
+    env[k] = v === undefined || v === null ? "" : String(v);
+  }
+  // 兼容入口原语义：API_KEY 去首尾空白（fail-closed 判定依赖精确匹配）
+  env.FREEBUFF_API_KEY = env.FREEBUFF_API_KEY.trim();
+  return env;
+}

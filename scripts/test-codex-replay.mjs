@@ -159,7 +159,9 @@ const r1 = await replay(turn1.body, nativeExecStream("echo captured-roundtrip"))
     check("R1 dropped field: " + k, !(k in (up || {})), "found " + k);
   }
   const msgs = up?.messages || [];
-  check("R1 6 messages (5 system + 1 user)", msgs.length === 6, "count=" + msgs.length);
+  // P8：有工具的 DeepSeek 会话多一条引导 system 提示（首条 system 之后），故 7 条
+  check("R1 7 messages (6 system incl. hint + 1 user)", msgs.length === 7, "count=" + msgs.length);
+  check("R1 hint is 2nd system message", msgs[1]?.role === "system" && String(msgs[1]?.content || "").includes("Tool-use guidance"), JSON.stringify(msgs[1]?.content).slice(0, 120));
   check("R1 developer converted to system", msgs.every((m) => m.role !== "developer"), msgs.map((m) => m.role).join(","));
   const firstSysText = Array.isArray(msgs[0]?.content) ? msgs[0].content.map((p) => p.text || "").join("") : String(msgs[0]?.content || "");
   check("R1 first system message has Buffy prefix", firstSysText.startsWith("You are Buffy, the strategic coding assistant."), firstSysText.slice(0, 60));

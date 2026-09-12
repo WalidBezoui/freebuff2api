@@ -7,7 +7,7 @@
   "description": "freebuff-api worker.js running in Node container",
   "scripts": {
     "start": "node scripts/server.mjs",
-    "test": "node --check worker.js && node scripts/check-fixtures.mjs && node scripts/test-tools.mjs && node scripts/test-codex-replay.mjs && node scripts/test-security.mjs",
+    "test": "node --check worker.js && node scripts/check-fixtures.mjs && node scripts/check-env.mjs && node scripts/test-tools.mjs && node scripts/test-codex-replay.mjs && node scripts/test-security.mjs",
     "test:live": "node scripts/test-live.mjs"
   },
   "engines": {

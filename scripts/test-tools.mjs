@@ -1142,6 +1142,312 @@ async function readRawSSE(res) {
   check("T49 write_file has path and content properties", !!wfTool?.function?.parameters?.properties?.path && !!wfTool?.function?.parameters?.properties?.content, JSON.stringify(wfTool));
 }
 
+// ---------- T50: P1 DeepSeek default effort injection (FREEBUFF_DEFAULT_EFFORT,缺省max) ----------
+{
+  const okChunk = [{ id: "cmpl-t50", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] }];
+  const noEffortBody = (model, env) => {
+    currentStream = [...okChunk];
+    upstreamChatBodies = [];
+    const req = new Request("https://localhost/v1/responses", {
+      method: "POST", headers: AUTH,
+      body: JSON.stringify({ model, input: [{ role: "user", content: "hi" }], stream: false }),
+    });
+    return worker.fetch(req, env).then(() => upstreamChatBodies[0]?.body?.reasoning_effort);
+  };
+  check("T50 flash absent -> default max", (await noEffortBody(MODEL, ENV)) === "max", JSON.stringify(upstreamChatBodies[0]?.body?.reasoning_effort));
+  check("T50 pro absent -> default max", (await noEffortBody("deepseek/deepseek-v4-pro", ENV)) === "max", "");
+  check("T50 env override low respected", (await noEffortBody(MODEL, { ...ENV, FREEBUFF_DEFAULT_EFFORT: "low" })) === "low", "");
+  check("T50 env override medium clamped to low on flash", (await noEffortBody(MODEL, { ...ENV, FREEBUFF_DEFAULT_EFFORT: "medium" })) === "low", "");
+  // 显式 effort 永远优先，不被默认值覆盖
+  currentStream = [...okChunk];
+  upstreamChatBodies = [];
+  await worker.fetch(new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "hi" }], stream: false, reasoning: { effort: "low" } }),
+  }), ENV);
+  check("T50 explicit low kept", upstreamChatBodies[0]?.body?.reasoning_effort === "low", JSON.stringify(upstreamChatBodies[0]?.body?.reasoning_effort));
+  currentStream = [...okChunk];
+  upstreamChatBodies = [];
+  await worker.fetch(new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "hi" }], stream: false, reasoning: { effort: "medium" } }),
+  }), ENV);
+  check("T50 explicit medium clamped to low (flash has no medium)", upstreamChatBodies[0]?.body?.reasoning_effort === "low", JSON.stringify(upstreamChatBodies[0]?.body?.reasoning_effort));
+}
+
+// ---------- T51: P2 backtick bash fence fallback -> exec (conservative gate) ----------
+{
+  const fenceStream = (text) => [
+    chunk({ role: "assistant", content: text }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+  ];
+  // 单一 bash 块、无 XML → 转 exec，且 fence 不泄露
+  const events = await responsesStreamTest(fenceStream("Here you go:\n```bash\nnpm test\n```\n"), execTools, [{ role: "user", content: "run tests" }]);
+  const completed = events.find((e) => e.type === "response.completed");
+  const tools = (completed?.response?.output || []).filter((o) => o.type === "custom_tool_call");
+  check("T51 fence -> exactly one exec", tools.length === 1 && tools[0]?.name === "exec", JSON.stringify(tools));
+  check("T51 fence input correct", tools[0]?.input === textOf("npm test"), JSON.stringify(tools[0]));
+  check("T51 fence not leaked", !JSON.stringify(events).includes("```"), "");
+  // XML 与 fence 共存 → XML 胜出，不双发
+  const dsml = `<${P}invoke name="exec_command"><${P}parameter name="cmd">dir /b</${P}parameter></${P}invoke>`;
+  const events2 = await responsesStreamTest(fenceStream("Running.\n" + dsml + "\n```bash\nnpm test\n```"), execTools, [{ role: "user", content: "run" }]);
+  const completed2 = events2.find((e) => e.type === "response.completed");
+  const tools2 = (completed2?.response?.output || []).filter((o) => o.type === "custom_tool_call");
+  check("T51 XML wins, no double-call", tools2.length === 1 && tools2[0]?.input === textOf("dir /b"), JSON.stringify(tools2));
+  // 无语言 fence → 不转（普通代码示例风险）
+  const events3 = await responsesStreamTest(fenceStream("See:\n```\nnpm test\n```"), execTools, [{ role: "user", content: "show" }]);
+  const completed3 = events3.find((e) => e.type === "response.completed");
+  check("T51 plain fence not converted", !(completed3?.response?.output || []).some((o) => o.type === "custom_tool_call"), JSON.stringify(completed3?.response?.output));
+  // kill-switch 关闭 → 不转
+  currentStream = fenceStream("Run it:\n```bash\nnpm test\n```");
+  upstreamChatBodies = [];
+  const reqOff = new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "run" }], tools: execTools, stream: true }),
+  });
+  const resOff = await worker.fetch(reqOff, { ...ENV, FREEBUFF_BASH_FALLBACK: "0" });
+  const eventsOff = await readSSE(resOff);
+  const completedOff = eventsOff.find((e) => e.type === "response.completed");
+  check("T51 fallback disabled -> no tool call", !(completedOff?.response?.output || []).some((o) => o.type === "custom_tool_call"), "");
+}
+
+// ---------- T52: P3 read_file 体积守卫 baked-in (FREEBUFF_MAX_READ_FILE_BYTES) ----------
+{
+  const readStream = () => [
+    chunk({ tool_calls: [{ index: 0, id: "call_r52", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: "package.json" }) } }] }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ];
+  const getReadInput = async (env) => {
+    currentStream = readStream();
+    upstreamChatBodies = [];
+    const req = new Request("https://localhost/v1/responses", {
+      method: "POST", headers: AUTH,
+      body: JSON.stringify({ model: MODEL, input: [{ role: "user", content: "read" }], tools: execTools, stream: true }),
+    });
+    const res = await worker.fetch(req, env);
+    const events = await readSSE(res);
+    const completed = events.find((e) => e.type === "response.completed");
+    return (completed?.response?.output || []).find((o) => o.type === "custom_tool_call");
+  };
+  const toolDef = await getReadInput(ENV);
+  check("T52 default guard present (statSync + 524288)", !!toolDef?.input?.includes("statSync") && toolDef.input.includes("524288"), String(toolDef?.input).slice(0, 200));
+  const toolCustom = await getReadInput({ ...ENV, FREEBUFF_MAX_READ_FILE_BYTES: "1024" });
+  check("T52 custom limit baked in", !!toolCustom?.input?.includes("statSync") && toolCustom.input.includes("1024"), String(toolCustom?.input).slice(0, 200));
+  const toolOff = await getReadInput({ ...ENV, FREEBUFF_MAX_READ_FILE_BYTES: "0" });
+  check("T52 limit 0 -> no guard", !!toolOff && !toolOff.input.includes("statSync"), String(toolOff?.input).slice(0, 200));
+}
+
+// ---------- T53: P4 非流式 <thinking> 剥离 (与流式 StreamingXmlFilter 对齐) ----------
+{
+  currentStream = [
+    chunk({ role: "assistant", content: "<thinking>private plan</thinking>some visible text" }),
+    { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+  ];
+  upstreamChatBodies = [];
+  const req = new Request("https://localhost/v1/chat/completions", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, stream: false, messages: [{ role: "user", content: "hi" }] }),
+  });
+  const res = await worker.fetch(req, ENV);
+  const json = await res.json();
+  const text = json?.choices?.[0]?.message?.content || "";
+  check("T53 thinking stripped, visible kept", text.includes("some visible text") && !text.includes("private plan"), JSON.stringify(text));
+  check("T53 no thinking tags leak", !text.includes("<thinking>") && !text.includes("</thinking>"), JSON.stringify(text));
+}
+
+// ---------- T54: P8 DeepSeek steering hint (tools-gated, BUFFY byte-0 intact) ----------
+{
+  const okChunk = [{ id: "cmpl-t54", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] }];
+  const upMessages = async (body, env = ENV) => {
+    currentStream = [...okChunk];
+    upstreamChatBodies = [];
+    await worker.fetch(new Request("https://localhost/v1/responses", {
+      method: "POST", headers: AUTH, body: JSON.stringify(body),
+    }), env);
+    return upstreamChatBodies[0]?.body?.messages || [];
+  };
+  const sysTexts = (msgs) => msgs.filter((m) => m.role === "system").map((m) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+  // with tools -> hint present as 2nd system, BUFFY still byte-0 on 1st
+  let msgs = await upMessages({ model: MODEL, input: [{ role: "user", content: "hi" }], tools: execTools, stream: false });
+  let sys = sysTexts(msgs);
+  check("T54 hint injected with tools", sys.length >= 2 && sys[1].includes("Tool-use guidance"), JSON.stringify(sys).slice(0, 200));
+  check("T54 BUFFY still byte-0", sys[0].startsWith("You are Buffy"), JSON.stringify(sys[0]).slice(0, 80));
+  check("T54 hint mentions write_file", sys[1].includes("write_file"), "");
+  // without tools -> no hint (pure QA wastes no context).
+  // 注：responses 无工具请求仍会被注入默认 exec 工具集（Codex 首回合），故此处用
+  // 纯 chat 无工具路径验证真正的"零工具上游"场景。
+  currentStream = [...okChunk];
+  upstreamChatBodies = [];
+  await worker.fetch(new Request("https://localhost/v1/chat/completions", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, stream: false, messages: [{ role: "user", content: "hi" }] }),
+  }), ENV);
+  msgs = upstreamChatBodies[0]?.body?.messages || [];
+  sys = sysTexts(msgs);
+  check("T54 no hint without tools", !sys.some((t) => t.includes("Tool-use guidance")), JSON.stringify(sys).slice(0, 160));
+  // non-DeepSeek model with tools -> no hint
+  msgs = await upMessages({ model: "openai/gpt-5.6-luna", input: [{ role: "user", content: "hi" }], tools: execTools, stream: false });
+  sys = sysTexts(msgs);
+  check("T54 no hint for non-DeepSeek", !sys.some((t) => t.includes("Tool-use guidance")), JSON.stringify(sys).slice(0, 160));
+  // opt-out -> no hint even with tools
+  msgs = await upMessages({ model: MODEL, input: [{ role: "user", content: "hi" }], tools: execTools, stream: false }, { ...ENV, FREEBUFF_DEEPSEEK_HINTS: "0" });
+  sys = sysTexts(msgs);
+  check("T54 opt-out disables hint", !sys.some((t) => t.includes("Tool-use guidance")), "");
+}
+
+// ---------- T55: P9a nonzero exit codes preserved in tool output ----------
+{
+  const failOut = JSON.stringify({ chunk_id: "chk_9a", exit_code: 1, output: "boom happened", session_id: "s1" });
+  currentStream = [{ id: "cmpl-t55", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] }];
+  upstreamChatBodies = [];
+  await worker.fetch(new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: false,
+      input: [
+        { role: "user", content: "run" },
+        { type: "function_call", call_id: "call_9a", name: "exec", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_9a", output: failOut },
+      ],
+    }),
+  }), ENV);
+  const toolMsg = (upstreamChatBodies[0]?.body?.messages || []).find((m) => m.role === "tool");
+  check("T55 nonzero exit code suffixed", !!toolMsg && toolMsg.content.includes("boom happened") && toolMsg.content.includes("[exit code: 1]"), JSON.stringify(toolMsg).slice(0, 200));
+  check("T55 no chunk_id noise", !!toolMsg && !toolMsg.content.includes("chunk_id"), JSON.stringify(toolMsg).slice(0, 200));
+  // exit 0 -> no suffix (T19 behavior preserved)
+  const okOut = JSON.stringify({ chunk_id: "chk_9b", exit_code: 0, output: "fine" });
+  currentStream = [{ id: "cmpl-t55b", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] }];
+  upstreamChatBodies = [];
+  await worker.fetch(new Request("https://localhost/v1/responses", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({
+      model: MODEL, stream: false,
+      input: [
+        { role: "user", content: "run" },
+        { type: "function_call", call_id: "call_9b", name: "exec", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_9b", output: okOut },
+      ],
+    }),
+  }), ENV);
+  const toolMsg2 = (upstreamChatBodies[0]?.body?.messages || []).find((m) => m.role === "tool");
+  check("T55 zero exit -> no suffix", !!toolMsg2 && toolMsg2.content === "fine", JSON.stringify(toolMsg2).slice(0, 160));
+}
+
+// ---------- T56: P9 retry-loop nudge (threshold 3, once per command, reset on success) ----------
+{
+  const okChunk = [{ id: "cmpl-t56", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] }];
+  // 一轮失败 turn：assistant tool_calls(cmd) + tool 结果 errText；返回上游 tool 消息 content
+  const failTurn = async (cmd, errText, env = ENV) => {
+    currentStream = [...okChunk];
+    upstreamChatBodies = [];
+    await worker.fetch(new Request("https://localhost/v1/responses", {
+      method: "POST", headers: AUTH,
+      body: JSON.stringify({
+        model: MODEL, stream: false, tools: execTools,
+        input: [
+          { role: "user", content: "do it" },
+          { type: "function_call", call_id: "call_" + cmd, name: "exec", arguments: JSON.stringify({ command: cmd }) },
+          { type: "function_call_output", call_id: "call_" + cmd, output: errText },
+          { role: "user", content: "again" },
+        ],
+      }),
+    }), env);
+    const toolMsg = (upstreamChatBodies[0]?.body?.messages || []).find((m) => m.role === "tool");
+    return typeof toolMsg?.content === "string" ? toolMsg.content : "";
+  };
+  const countNudges = (s) => (s.match(/\[freebuff hint\]/g) || []).length;
+  const CMD = "doomed-cmd-T56";
+  const ERR = "Error: " + CMD + " failed miserably";
+  const c1 = await failTurn(CMD, ERR);
+  check("T56 1st failure: no nudge", countNudges(c1) === 0 && c1.includes("failed miserably"), c1.slice(0, 160));
+  const c2 = await failTurn(CMD, ERR);
+  check("T56 2nd failure: no nudge", countNudges(c2) === 0, c2.slice(0, 160));
+  const c3 = await failTurn(CMD, ERR);
+  check("T56 3rd failure: exactly one nudge", countNudges(c3) === 1 && c3.includes("Change strategy"), c3.slice(-200));
+  const c4 = await failTurn(CMD, ERR);
+  check("T56 4th failure: still exactly one (no accumulation)", countNudges(c4) === 1, c4.slice(-200));
+  // 成功即清零：同命令一次成功后，下一次失败重新计数（无注记）
+  await failTurn(CMD, "clean output, all good");
+  const c5 = await failTurn(CMD, ERR);
+  check("T56 success resets counter", countNudges(c5) === 0, c5.slice(0, 160));
+  //阈值覆盖：FREEBUFF_LOOP_THRESHOLD=2 → 第 2 次即注记（独立命令避免计数串扰）
+  const CMD2 = "doomed-cmd-T56b";
+  const ERR2 = "Error: " + CMD2 + " exploded";
+  const tEnv = { ...ENV, FREEBUFF_LOOP_THRESHOLD: "2" };
+  const d1 = await failTurn(CMD2, ERR2, tEnv);
+  check("T56 threshold=2: 1st no nudge", countNudges(d1) === 0, "");
+  const d2 = await failTurn(CMD2, ERR2, tEnv);
+  check("T56 threshold=2: 2nd nudged", countNudges(d2) === 1, d2.slice(-200));
+  // 总开关关闭：3 次失败也不注记（独立命令）
+  const CMD3 = "doomed-cmd-T56c";
+  const ERR3 = "Error: " + CMD3 + " kaput";
+  const offEnv = { ...ENV, FREEBUFF_LOOP_NUDGE: "0" };
+  await failTurn(CMD3, ERR3, offEnv);
+  await failTurn(CMD3, ERR3, offEnv);
+  const o3 = await failTurn(CMD3, ERR3, offEnv);
+  check("T56 disabled: no nudge after 3 failures", countNudges(o3) === 0, o3.slice(0, 160));
+}
+
+// ---------- T57: Model aliases resolution (v4.1, short names, etc.) ----------
+{
+  const okChunk = [{ id: "cmpl-t57", object: "chat.completion.chunk", model: MODEL, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] }];
+  const testModelAlias = async (reqModel, expectedUpstreamModel) => {
+    currentStream = [...okChunk];
+    upstreamChatBodies = [];
+    const req = new Request("https://localhost/v1/chat/completions", {
+      method: "POST", headers: AUTH,
+      body: JSON.stringify({ model: reqModel, messages: [{ role: "user", content: "hi" }] }),
+    });
+    const res = await worker.fetch(req, ENV);
+    const upModel = upstreamChatBodies[0]?.body?.model;
+    return { status: res.status, upModel };
+  };
+
+  const a1 = await testModelAlias("deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4-flash");
+  check("T57 deepseek/deepseek-v4.1-flash resolves to v4-flash", a1.status === 200 && a1.upModel === "deepseek/deepseek-v4-flash", JSON.stringify(a1));
+
+  const a2 = await testModelAlias("deepseek-v4.1-flash", "deepseek/deepseek-v4-flash");
+  check("T57 deepseek-v4.1-flash resolves to v4-flash", a2.status === 200 && a2.upModel === "deepseek/deepseek-v4-flash", JSON.stringify(a2));
+
+  const a3 = await testModelAlias("deepseek-v4-flash", "deepseek/deepseek-v4-flash");
+  check("T57 deepseek-v4-flash resolves to v4-flash", a3.status === 200 && a3.upModel === "deepseek/deepseek-v4-flash", JSON.stringify(a3));
+
+  const a4 = await testModelAlias("deepseek-v4-pro", "deepseek/deepseek-v4-pro");
+  check("T57 deepseek-v4-pro resolves to v4-pro", a4.status === 200 && a4.upModel === "deepseek/deepseek-v4-pro", JSON.stringify(a4));
+
+  const a5 = await testModelAlias("google/gemini-3.8-flash", "google/gemini-3.8-flash");
+  check("T57 google/gemini-3.8-flash resolves", a5.status === 200 && a5.upModel === "google/gemini-3.8-flash", JSON.stringify(a5));
+}
+
+// ---------- T58: Banned account quarantine & failover ----------
+{
+  const bannedToken = "tok_banned_test_123";
+  const validToken = "tok_valid_test_456";
+  const multiEnv = { ...ENV, FREEBUFF_TOKEN: `${bannedToken},${validToken}` };
+
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    const authHeader = init.headers?.Authorization || "";
+    if (authHeader.includes(bannedToken)) {
+      if (u.includes("/api/v1/freebuff/session")) {
+        return new Response(JSON.stringify({ status: "banned" }), { status: 403, headers: { "Content-Type": "application/json" } });
+      }
+    }
+    return savedFetch(url, init);
+  };
+
+  const req = new Request("https://localhost/v1/chat/completions", {
+    method: "POST", headers: AUTH,
+    body: JSON.stringify({ model: MODEL, messages: [{ role: "user", content: "test" }] }),
+  });
+  const res = await worker.fetch(req, multiEnv);
+  check("T58 banned account automatically fails over to second account", res.status === 200, "status=" + res.status);
+
+  // Restore fetch
+  globalThis.fetch = savedFetch;
+}
+
 clearTimeout(suiteTimer);
 const failed = results.filter((r) => !r.ok);
 console.log("\n=== " + (results.length - failed.length) + "/" + results.length + " passed ===");

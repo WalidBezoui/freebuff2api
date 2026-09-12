@@ -1,20 +1,14 @@
 import worker from '../worker.js';
-import { loadDotEnv } from '../load-env.mjs';
+import { loadDotEnv, buildWorkerEnv } from '../load-env.mjs';
 
 loadDotEnv();
 
 export default async function handler(req, res) {
   const handlerFunc = worker.default ? worker.default.fetch : worker.fetch;
 
-  const env = {
-    FREEBUFF_TOKEN: process.env.FREEBUFF_TOKEN || '',
-    // 不设默认密钥：未配置时所有请求 fail-closed（worker.getApiKey 返回 null → 401）。
-    FREEBUFF_API_KEY: (process.env.FREEBUFF_API_KEY || '').trim(),
-    FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
-    CODEBUFF_API: process.env.CODEBUFF_API || '',
-    RELAY_KEY: process.env.RELAY_KEY || '',
-    FREEBUFF_MAX_TOOL_OUTPUT: process.env.FREEBUFF_MAX_TOOL_OUTPUT || '',
-  };
+  // P10：经共享透传表构造 env（新增 worker env 键只需改 load-env.mjs 一处）。
+  // 不设默认密钥：未配置时所有请求 fail-closed（worker.getApiKey 返回 null → 401）。
+  const env = buildWorkerEnv(process.env);
 
   const abortCtrl = new AbortController();
   const onClose = () => { try { abortCtrl.abort(new Error("client disconnect")); } catch {} };

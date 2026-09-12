@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadDotEnv } from '../load-env.mjs';
+import { loadDotEnv, buildWorkerEnv } from '../load-env.mjs';
 
 loadDotEnv();
 
@@ -61,14 +61,13 @@ if (envToken) {
 }
 
 const env = {
+  // P10：共享透传表（新增 worker env 键只需改 load-env.mjs 一处）；
+  // token 仍优先 credentials/ 目录聚合结果（原语义保留）。
+  ...buildWorkerEnv(process.env),
   FREEBUFF_TOKEN: tokenLines.join(','),
   // 不设默认密钥：未配置时所有请求 fail-closed（worker.getApiKey 返回 null → 401）。
   // 如需本地开发，请在 .env 或环境变量中显式设置 FREEBUFF_API_KEY。
   FREEBUFF_API_KEY: (process.env.FREEBUFF_API_KEY || '').trim(),
-  FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
-  CODEBUFF_API: process.env.CODEBUFF_API || '',
-  RELAY_KEY: process.env.RELAY_KEY || '',
-  FREEBUFF_MAX_TOOL_OUTPUT: process.env.FREEBUFF_MAX_TOOL_OUTPUT || '',
 };
 
 if (!env.FREEBUFF_API_KEY) {

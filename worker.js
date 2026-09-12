@@ -345,12 +345,52 @@ const MODELS = [
   { id: "openrouter/poolside/laguna-s-2.1", session: "openrouter/poolside/laguna-s-2.1", agent: "base2-free-laguna-s-2-1-openrouter", upstream: "openrouter/poolside/laguna-s-2.1" },
   { id: "crof/kimi-k3-eco", session: "crof/kimi-k3-eco", agent: "base2-free-kimi-k3-eco", upstream: "crof/kimi-k3-eco" },
   { id: "anthropic/claude-fable-5", session: "anthropic/claude-fable-5", agent: "base2-free-fable", upstream: "anthropic/claude-fable-5" },
+  { id: "google/gemini-3.8-flash", session: "google/gemini-3.8-flash", agent: "base3-free-gemini-3-8-flash", upstream: "google/gemini-3.8-flash" },
+  { id: "upstage/solar-pro-4", session: "upstage/solar-pro-4", agent: "base3-free-solar-pro4", upstream: "upstage/solar-pro-4" },
+  { id: "stealth/ox-alpha", session: "stealth/ox-alpha", agent: "base3-free-ox-alpha", upstream: "stealth/ox-alpha" },
   { id: "meta/muse-spark-1.2-contributor", session: "meta/muse-spark-1.2-contributor", agent: "base3-free-muse-spark", upstream: "meta/muse-spark-1.2-contributor" },
   { id: "meta/muse-spark-1.3-contributor", session: "meta/muse-spark-1.3-contributor", agent: "base3-free-muse-spark-1-3", upstream: "meta/muse-spark-1.3-contributor" },
   { id: "meta/muse-spark-1.3", session: "meta/muse-spark-1.3-contributor", agent: "base3-free-muse-spark-1-3", upstream: "meta/muse-spark-1.3-contributor" },
   { id: "musespark-1.3", session: "meta/muse-spark-1.3-contributor", agent: "base3-free-muse-spark-1-3", upstream: "meta/muse-spark-1.3-contributor" },
   { id: "muse-spark-1.3", session: "meta/muse-spark-1.3-contributor", agent: "base3-free-muse-spark-1-3", upstream: "meta/muse-spark-1.3-contributor" },
 ];
+
+const MODEL_ALIASES = {
+  // DeepSeek Flash aliases (including V4.1, short names, etc.)
+  "deepseek/deepseek-v4.1-flash": "deepseek/deepseek-v4-flash",
+  "deepseek-v4.1-flash": "deepseek/deepseek-v4-flash",
+  "deepseek/deepseek-v4.1": "deepseek/deepseek-v4-flash",
+  "deepseek-v4.1": "deepseek/deepseek-v4-flash",
+  "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
+  "deepseek-v4": "deepseek/deepseek-v4-flash",
+  "deepseek": "deepseek/deepseek-v4-flash",
+  "v4-flash": "deepseek/deepseek-v4-flash",
+  "v4.1-flash": "deepseek/deepseek-v4-flash",
+  "deepseek-flash": "deepseek/deepseek-v4-flash",
+
+  // DeepSeek Pro aliases
+  "deepseek-v4-pro": "deepseek/deepseek-v4-pro",
+  "deepseek/deepseek-v4.1-pro": "deepseek/deepseek-v4-pro",
+  "deepseek-v4.1-pro": "deepseek/deepseek-v4-pro",
+  "v4-pro": "deepseek/deepseek-v4-pro",
+  "v4.1-pro": "deepseek/deepseek-v4-pro",
+  "deepseek-pro": "deepseek/deepseek-v4-pro",
+
+  // Other common shortcuts
+  "gemini-3.8-flash": "google/gemini-3.8-flash",
+  "gemini-3.8": "google/gemini-3.8-flash",
+  "google/gemini-3.8": "google/gemini-3.8-flash",
+  "kimi-k3-eco": "crof/kimi-k3-eco",
+  "kimi-k3": "crof/kimi-k3-eco",
+  "solar-pro-4": "upstage/solar-pro-4",
+  "ox-alpha": "stealth/ox-alpha",
+  "luna": "openai/gpt-5.6-luna",
+  "gpt-5.6-luna": "openai/gpt-5.6-luna",
+  "m3": "minimax/minimax-m3",
+  "minimax-m3": "minimax/minimax-m3",
+  "mimo": "mimo/mimo-v2.5",
+  "mimo-v2.5": "mimo/mimo-v2.5",
+};
 
 // ---------------------------------------------------------------------------
 // 额度池说明（逆向自官方源码 freebuff-models.ts，2026-08-10 实证）
@@ -444,6 +484,49 @@ export default {
       maxImageBytes = Number.isFinite(v) && v > 0 ? Math.floor(v) : 10 * 1024 * 1024;
     } else {
       maxImageBytes = 10 * 1024 * 1024;
+    }
+    // 同步 DeepSeek 默认 effort（P1）：仅接受 ladder 已知档位，否则回退 "max"
+    if (env && env.FREEBUFF_DEFAULT_EFFORT !== undefined && env.FREEBUFF_DEFAULT_EFFORT !== "") {
+      const v = String(env.FREEBUFF_DEFAULT_EFFORT).trim().toLowerCase();
+      defaultEffort = REASONING_EFFORT_RANK.includes(v) ? v : "max";
+    } else {
+      defaultEffort = "max";
+    }
+    // 同步 backtick 回退开关（P2）：显式 0/false 关闭，其余视为开启
+    if (env && env.FREEBUFF_BASH_FALLBACK !== undefined && env.FREEBUFF_BASH_FALLBACK !== "") {
+      const v = String(env.FREEBUFF_BASH_FALLBACK).trim().toLowerCase();
+      bashFallbackEnabled = !(v === "0" || v === "false" || v === "off" || v === "no");
+    } else {
+      bashFallbackEnabled = true;
+    }
+    // 同步 read_file 体积上限（P3）：0 = 不限；缺省 512KB
+    if (env && env.FREEBUFF_MAX_READ_FILE_BYTES !== undefined && env.FREEBUFF_MAX_READ_FILE_BYTES !== "") {
+      const v = Number(env.FREEBUFF_MAX_READ_FILE_BYTES);
+      maxReadFileBytes = Number.isFinite(v) && v >= 0 ? Math.floor(v) : 524288;
+    } else {
+      maxReadFileBytes = 524288;
+    }
+    // 同步调试开关镜像（P6）
+    freebuffDebug = !!(env && env.FREEBUFF_DEBUG === "true");
+    // 同步 DeepSeek 引导提示开关（P8）：显式 0/false 关闭，其余视为开启
+    if (env && env.FREEBUFF_DEEPSEEK_HINTS !== undefined && env.FREEBUFF_DEEPSEEK_HINTS !== "") {
+      const v = String(env.FREEBUFF_DEEPSEEK_HINTS).trim().toLowerCase();
+      deepseekHintsEnabled = !(v === "0" || v === "false" || v === "off" || v === "no");
+    } else {
+      deepseekHintsEnabled = true;
+    }
+    // 同步重试循环提醒开关与阈值（P9）：显式 0/false 关闭；阈值非法回退 3
+    if (env && env.FREEBUFF_LOOP_NUDGE !== undefined && env.FREEBUFF_LOOP_NUDGE !== "") {
+      const v = String(env.FREEBUFF_LOOP_NUDGE).trim().toLowerCase();
+      loopNudgeEnabled = !(v === "0" || v === "false" || v === "off" || v === "no");
+    } else {
+      loopNudgeEnabled = true;
+    }
+    if (env && env.FREEBUFF_LOOP_THRESHOLD !== undefined && env.FREEBUFF_LOOP_THRESHOLD !== "") {
+      const v = Number(env.FREEBUFF_LOOP_THRESHOLD);
+      loopNudgeThreshold = Number.isFinite(v) && v >= 2 ? Math.floor(v) : 3;
+    } else {
+      loopNudgeThreshold = 3;
     }
     const pathname = url.pathname.replace(/^\/api(?=\/|$)/, "") || "/";
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
@@ -539,6 +622,7 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
   if (typeof dataOrText === "string") {
     try { data = JSON.parse(dataOrText); } catch { data = null; }
   }
+  const rawStr = String(dataOrText || "");
   const upstreamState = data && typeof data === "object" ? data.status || data.state : null;
   let state = null;
   if (status === 404) state = "ok";
@@ -546,9 +630,9 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
   else if (status >= 200 && status < 300) state = "ok";
   else if (status === 401) state = "token_invalid";
   else if (status === 403) {
-    state = upstreamState === "banned"
+    state = upstreamState === "banned" || /banned/i.test(rawStr)
       ? "banned"
-      : upstreamState === "country_blocked" ? "country_blocked" : "blocked";
+      : (upstreamState === "country_blocked" || /country_blocked|country_not_allowed/i.test(rawStr)) ? "country_blocked" : "blocked";
   } else if (status === 429) state = "rate_limited";
   if (!state) return;
 
@@ -565,6 +649,12 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
     retryAfterMs: state === "ok" ? null : (typeof extra.retryAfterMs === "number" ? extra.retryAfterMs : previous.retryAfterMs || null),
     checkedAt: Date.now(),
   });
+
+  // 永久性失效状态（封禁/凭证失效）：立即清理会话缓存并强制最大冷却，防止本实例后续误选
+  if (HEALTH_PERMANENT_STATES.has(state)) {
+    invalidateSessionCache(token);
+    cooldown(token, MAX_COOLDOWN_MS);
+  }
 }
 
 function summarizeAccountHealth(pool, health) {
@@ -1182,7 +1272,7 @@ async function finishRun(token, runId, totalSteps) {
 // 精简版：只 START 两个 run（chat 只校验 run_id 存在，recordStep/finishRun 可跳过），
 // 实测链路总耗时 4s 内（原版 8s），满足 qwenpaw check_model_connection 5s 超时
 const runCache = new Map();   // `${token}:${agentId}` -> { runId, childRunId, ts }
-const RUN_CACHE_TTL_MS = 10 * 60 * 1000; // 实测 run_id 可跨请求复用（上游只校验存在性），10min 缓存省两次上游调用
+const RUN_CACHE_TTL_MS = 55 * 60 * 1000; // P5：run_id 与 session 同寿（session ~60min，留 5min 缓冲）；10min 会导致长会话每 10min 多两次 startRun 上游调用。session 重建路径已有 runCache.delete() 兜底，陈旧 run_id 会被驱逐。
 
 async function startRunChain(token, agentId) {
   const key = token + ":" + agentId;
@@ -1212,6 +1302,11 @@ const UPSTREAM_KEYS = [
 // 字节级开头（服务端 hasFreebuffRootSystemPromptOpening 检查，旧 `[System Override...]`
 // 前缀绕过已被官方修补并返回 403 free_mode_cli_required）。
 const BUFFY = "You are Buffy, the strategic coding assistant.";
+
+// P8：DeepSeek 工具引导提示（常量字符串，利好上游前缀缓存）。
+// 覆盖三类真实翻车：shell heredoc 写文件被引号吞标签、零意图直接调工具、同命令裸重试。
+// 仅工具会话注入（buildUpstreamPayload 内按模型+tools 门控），纯问答不浪费上下文。
+const DEEPSEEK_TOOL_HINTS = "Tool-use guidance: prefer the write_file/read_file/apply_patch tools over composing file content inside shell heredocs or PowerShell here-strings (angle brackets and backticks get mangled by shell quoting). State your intent in one sentence before calling a tool. If the identical command fails repeatedly, change strategy instead of retrying it verbatim.";
 
 function ensureValidJsonArguments(args) {
   if (args === undefined || args === null) return "{}";
@@ -1338,10 +1433,26 @@ function buildUpstreamPayload(params, mc, sess, runId) {
   const payload = {};
   for (const k of UPSTREAM_KEYS) if (params[k] !== undefined && params[k] !== null) payload[k] = params[k];
   delete payload.reasoning;
-  // reasoning_effort 按官方模型 efforts 表 clamp-down（不拒绝、不换模型）
-  if (payload.reasoning_effort !== undefined && payload.reasoning_effort !== null) {
-    if (payload.reasoning_effort === "ultra") payload.reasoning_effort = "max";
+  // reasoning_effort 按官方模型 efforts 表 clamp-down（不拒绝、不换模型）。
+  // P1：客户端未传 effort 且模型是 DeepSeek 时注入默认档（FREEBUFF_DEFAULT_EFFORT，
+  // 缺省 "max"；同 session 按创建计费，turn 内高 effort 无额外 quota 成本）。
+  // P6：clamp/注入改动档位时打 FREEBUFF_DEBUG 诊断日志。
+  if (payload.reasoning_effort === undefined || payload.reasoning_effort === null) {
+    const deepseekDefault = MODEL_EFFORTS[mc.id]
+      && (mc.id === "deepseek/deepseek-v4-flash" || mc.id === "deepseek/deepseek-v4-pro")
+      ? normalizeReasoningEffort(mc.id, defaultEffort) : undefined;
+    if (deepseekDefault !== undefined) {
+      if (freebuffDebug) console.log("[effort] " + mc.id + ": requested=<absent> -> default=" + deepseekDefault + " (FREEBUFF_DEFAULT_EFFORT=" + defaultEffort + ")");
+      payload.reasoning_effort = deepseekDefault;
+    }
+  } else {
+    // ultra 已在档位 ladder 内，clamp-down 自动归一到 max（与显式替换等价，此处不再预处理）
+    const before = String(payload.reasoning_effort);
     payload.reasoning_effort = normalizeReasoningEffort(mc.id, payload.reasoning_effort);
+    if (freebuffDebug && String(payload.reasoning_effort) !== before) {
+      const allowed = MODEL_EFFORTS[mc.id];
+      console.log("[effort] " + mc.id + ": requested=" + before + " -> clamped=" + payload.reasoning_effort + " (allowed: [" + (Array.isArray(allowed) ? allowed.join(",") : "*") + "])");
+    }
   }
   payload.model = mc.upstream;
   payload.messages = normalizeMessages(params.messages);
@@ -1353,6 +1464,16 @@ function buildUpstreamPayload(params, mc, sess, runId) {
     }
     return m;
   });
+  // P8：DeepSeek 工具引导提示——独立 system 消息插在首条 system 之后，
+  // BUFFY 字节-0 前缀不受影响；normalizeMessages 已保证首条 system 存在。
+  if (deepseekHintsEnabled
+    && (mc.id === "deepseek/deepseek-v4-flash" || mc.id === "deepseek/deepseek-v4-pro")
+    && Array.isArray(payload.tools) && payload.tools.length > 0) {
+    const hintMsg = { role: "system", content: DEEPSEEK_TOOL_HINTS, cache_control: { type: "ephemeral" } };
+    const firstSys = payload.messages.findIndex((m) => m && m.role === "system");
+    if (firstSys < 0) payload.messages.unshift({ role: "system", content: BUFFY, cache_control: { type: "ephemeral" } }, hintMsg);
+    else payload.messages.splice(firstSys + 1, 0, hintMsg);
+  }
   payload.stream = true;
   // 空 stop 数组（客户端显式传 stop:[]）等同未设置：必须补上官方要求的 cb_easp 终止符
   if (!payload.stop || (Array.isArray(payload.stop) && payload.stop.length === 0)) payload.stop = ['"cb_easp"'];
@@ -1457,11 +1578,15 @@ function buildReviewerPayload(params, mc, sess, reviewerRunId) {
 
 // 查找模型配置：硬编码 MODELS 优先，动态表补充（合并表）
 function findModelConfig(modelId) {
-  const hit = MODELS.find((m) => m.id === modelId);
+  if (!modelId || typeof modelId !== "string") return null;
+  const rawId = modelId.trim();
+  const lower = rawId.toLowerCase();
+  const targetId = MODEL_ALIASES[lower] || rawId;
+  const hit = MODELS.find((m) => m.id === targetId || m.id === rawId || m.id.toLowerCase() === lower);
   if (hit) return hit;
   const dyn = dynamicModelsCache.models;
   if (dyn) {
-    const d = dyn.find((m) => m.id === modelId);
+    const d = dyn.find((m) => m.id === targetId || m.id === rawId || m.id.toLowerCase() === lower);
     if (d) return d;
   }
   return null;
@@ -1733,9 +1858,126 @@ function responsesToChatParams(params, mc) {
 // 一次巨型输出撑爆。模块级变量，fetch() 每次请求同步 env.FREEBUFF_MAX_TOOL_OUTPUT
 // （0 = 不限；默认 32KB，按字符计）。
 let maxToolOutput = 32768;
+// DeepSeek 默认 effort（P1）：客户端未传 reasoning_effort 时注入，fetch() 同步
+// env.FREEBUFF_DEFAULT_EFFORT（默认 "max"；非法值回退 "max"）。
+let defaultEffort = "max";
+// Backtick bash fence 回退开关（P2）：默认开；FREEBUFF_BASH_FALLBACK=0/false 关闭。
+let bashFallbackEnabled = true;
+// read_file 体积上限（P3）：buildNodeReadFileScript  baked-in，fetch() 同步
+// env.FREEBUFF_MAX_READ_FILE_BYTES（默认 524288；0 = 不限）。
+let maxReadFileBytes = 524288;
+// 调试开关镜像（P6）：fetch() 同步 env.FREEBUFF_DEBUG，供无 env 入参的
+// buildUpstreamPayload/clamp 路径打 effort 诊断日志。
+let freebuffDebug = false;
+// DeepSeek 工具引导提示开关（P8）：默认开；FREEBUFF_DEEPSEEK_HINTS=0/false 关闭。
+let deepseekHintsEnabled = true;
+// 重试循环提醒（P9）：默认开；FREEBUFF_LOOP_NUDGE=0/false 关闭。
+// 同一命令连续失败达 loopNudgeThreshold 次即注记一次，不再重复打扰。
+let loopNudgeEnabled = true;
+let loopNudgeThreshold = 3;
+// P9 状态：`${token}:${sessionModel}:${cmdHash}` -> { fails, nudged, ts }，cleanCache() 按 TTL 清扫
+const loopTracker = new Map();
+const LOOP_TRACKER_TTL_MS = 60 * 60 * 1000;
+const LOOP_TRACKER_MAX_ENTRIES = 500;
 function capToolOutput(text) {
   if (!maxToolOutput || typeof text !== "string" || text.length <= maxToolOutput) return text;
   return text.slice(0, maxToolOutput) + "\n… [truncated by freebuff2api: " + text.length + " chars total]";
+}
+
+// P9a：exec 结果 JSON 自带 exit_code 时，非零值必须透传给模型——否则模型无法可靠
+// 判断命令失败，是裸重试循环的根因之一。以后缀行追加，不破坏原输出文本；
+// exit_code 为 0/缺失/非法时原样返回；已带后缀时幂等（多跳转手不叠加）。
+// （顶层定义：extractToolOutputText 内嵌于 responsesInputToMessages，此处声明供其调用，
+//   executeChat 的 P9 计数/注记函数亦需模块作用域。）
+function suffixExitCode(text, parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return text;
+  const code = parsed.exit_code;
+  if (typeof code !== "number" || !Number.isFinite(code) || code === 0) return text;
+  const s = typeof text === "string" ? text : String(text ?? "");
+  if (s.includes("[exit code:")) return s;
+  return s + "\n[exit code: " + code + "]";
+}
+
+// P9：重试循环提醒。同一命令连续失败达阈值时，在最新 tool 结果尾注记一次，
+// 打破"同命令裸重试 N 次"的 agent 循环。每命令每会话只注记一次（内容 marker 幂等）。
+const LOOP_NUDGE_TEXT = "\n[freebuff hint] This exact command has failed repeatedly in this session. Change strategy instead of retrying it verbatim (e.g. use write_file/apply_patch for file edits, or break the task into smaller commands).";
+const LOOP_NUDGE_MARKER = "[freebuff hint]";
+// 保守失败信号：P9a exit 后缀 / 常见错误词。纯文本启发式，阈值+单次注记兜底误伤。
+const FAILURE_MARKER_RE = /\[exit code: [1-9]|error|failed|failure|exception|traceback|not recognized|not found|command not found|no such file|access denied|permission denied/i;
+
+// 取 messages 中最后一条 role:tool 消息及其归属命令（经 tool_call_id 回溯紧邻 assistant）。
+// 返回 null 表示无可追踪对（无 tool 消息 / 命令为空）。
+function lastToolCommand(messages) {
+  if (!Array.isArray(messages)) return null;
+  let toolIdx = -1, toolMsg = null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && m.role === "tool") { toolIdx = i; toolMsg = m; break; }
+  }
+  if (!toolMsg) return null;
+  const callId = toolMsg.tool_call_id || toolMsg.id || "";
+  let cmd = "";
+  for (let i = toolIdx - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || typeof m !== "object") continue;
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const tc = (callId && m.tool_calls.find((t) => t && (t.id || "") === callId))
+        || (!callId && m.tool_calls[m.tool_calls.length - 1]);
+      if (tc) {
+        let args = tc.function?.arguments;
+        if (typeof args === "string" && args.trim().startsWith("{")) {
+          try { args = JSON.parse(args); } catch {}
+        }
+        cmd = extractExecCommandText(typeof args === "string" ? args : (args ?? ""));
+      }
+      break; // 只回溯紧邻的一条 assistant：跨消息归因不可靠
+    }
+    if (m.role === "user") break; // 被用户消息隔断：新一轮意图，不归因
+  }
+  cmd = (cmd || "").trim();
+  if (!cmd) return null;
+  const content = typeof toolMsg.content === "string" ? toolMsg.content : "";
+  return { cmd, content, toolMsg };
+}
+
+// 计数阶段：每请求调用一次（executeChat 入口），更新同一命令的连续失败数。
+// 成功（无失败信号）即清零；换命令即新 key（旧 key 自然过期，由 cleanCache 清扫）。
+function updateLoopTracker(token, sessionModel, messages) {
+  if (!loopNudgeEnabled) return;
+  const found = lastToolCommand(messages);
+  if (!found) return;
+  const key = (token || "") + ":" + (sessionModel || "") + ":" + stableFingerprint(found.cmd);
+  if (!FAILURE_MARKER_RE.test(found.content)) {
+    if (loopTracker.has(key)) loopTracker.delete(key);
+    return;
+  }
+  let st = loopTracker.get(key);
+  if (!st) {
+    st = { fails: 0, nudged: false, ts: Date.now() };
+    if (loopTracker.size >= LOOP_TRACKER_MAX_ENTRIES) {
+      const oldest = loopTracker.keys().next().value;
+      loopTracker.delete(oldest);
+    }
+  }
+  st.fails += 1;
+  st.ts = Date.now();
+  loopTracker.set(key, st);
+  if (freebuffDebug) console.log("[loop] cmd=" + JSON.stringify(found.cmd.slice(0, 80)) + " fails=" + st.fails + "/" + loopNudgeThreshold);
+}
+
+// 注记阶段：buildUpstreamPayload 之后对 payload.messages 执行（cap 之后，注记不被截断）。
+// 内容 marker 保证幂等：session 重建等重试路径重放也只注记一次。
+function applyLoopNudge(token, sessionModel, messages) {
+  if (!loopNudgeEnabled || !Array.isArray(messages)) return;
+  const found = lastToolCommand(messages);
+  if (!found || found.content.includes(LOOP_NUDGE_MARKER)) return;
+  const key = (token || "") + ":" + (sessionModel || "") + ":" + stableFingerprint(found.cmd);
+  const st = loopTracker.get(key);
+  if (!st || st.fails < loopNudgeThreshold) return;
+  st.nudged = true;
+  st.ts = Date.now();
+  found.toolMsg.content = found.content + LOOP_NUDGE_TEXT;
+  if (freebuffDebug) console.log("[loop] nudged cmd=" + JSON.stringify(found.cmd.slice(0, 80)));
 }
 
 function responsesInputToMessages(input, instructions) {
@@ -1801,9 +2043,9 @@ function extractToolOutputText(item) {
       try {
         const parsed = JSON.parse(trimmed);
         if (parsed && typeof parsed === "object") {
-          if (typeof parsed.output === "string") return parsed.output;
+          if (typeof parsed.output === "string") return suffixExitCode(parsed.output, parsed);
           if (Array.isArray(parsed.output)) {
-            return parsed.output.map((p) => typeof p === "string" ? p : (p?.text || p?.content || "")).join("");
+            return suffixExitCode(parsed.output.map((p) => typeof p === "string" ? p : (p?.text || p?.content || "")).join(""), parsed);
           }
         }
       } catch {}
@@ -1820,9 +2062,9 @@ function extractToolOutputText(item) {
       try {
         const parsed = JSON.parse(trimmed);
         if (parsed && typeof parsed === "object") {
-          if (typeof parsed.output === "string") return parsed.output;
+          if (typeof parsed.output === "string") return suffixExitCode(parsed.output, parsed);
           if (Array.isArray(parsed.output)) {
-            return parsed.output.map((p) => typeof p === "string" ? p : (p?.text || p?.content || "")).join("");
+            return suffixExitCode(parsed.output.map((p) => typeof p === "string" ? p : (p?.text || p?.content || "")).join(""), parsed);
           }
         }
       } catch {}
@@ -1834,11 +2076,11 @@ function extractToolOutputText(item) {
       const parts = [];
       if (o.stdout.trim()) parts.push(o.stdout);
       if (o.stderr.trim()) parts.push(o.stderr);
-      if (parts.length) return parts.join("\n");
+      if (parts.length) return suffixExitCode(parts.join("\n"), o);
     }
-    if (typeof o.stdout === "string" && o.stdout.trim()) return o.stdout;
-    if (typeof o.stderr === "string" && o.stderr.trim()) return o.stderr;
-    if (typeof o.output === "string") return o.output;
+    if (typeof o.stdout === "string" && o.stdout.trim()) return suffixExitCode(o.stdout, o);
+    if (typeof o.stderr === "string" && o.stderr.trim()) return suffixExitCode(o.stderr, o);
+    if (typeof o.output === "string") return suffixExitCode(o.output, o);
     if (typeof o.formatted_output === "string") return o.formatted_output;
     if (typeof o.text === "string") return o.text;
     if (typeof o.result === "string") return o.result;
@@ -2014,10 +2256,16 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
   // 请求内多号重试：一个号失败（超时/429/428 重建无效/run 失败）立即冷却并换下一个号，最多试完整个账号池。
   // 免费通道上游波动大（并发>1 即出问题、排队超时），单请求内换号比等客户端重试成功率高得多。
   let lastErrMsg = "";
+  // P9 计数阶段：每请求一次（首个可用 token 绑定会话身份），统计同命令连续失败
+  let loopCounted = false;
   for (let acctTry = 0; acctTry < pool.length; acctTry++) {
     const acct = pickToken(env, mc.session);
     const token = acct ? acct.token : null;
     if (!token) break;
+    if (!loopCounted) {
+      loopCounted = true;
+      updateLoopTracker(token, mc.session, chatParams.messages);
+    }
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
     try {
@@ -2034,6 +2282,8 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
       let resp, errText = "", sessForChat = sess;
       for (let attempt = 0; attempt < 2; attempt++) {
         const payload = buildUpstreamPayload(chatParams, mc, sessForChat, run.runId);
+        // P9 注记阶段：cap 之后追加（注记不被截断）；内容 marker 保证重放幂等
+        applyLoopNudge(token, mc.session, payload.messages);
         const headers = {
           Authorization: "Bearer " + token,
           "Content-Type": "application/json",
@@ -2203,10 +2453,27 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
         const m429 = msg.match(/429/);
         cooldown(token, m429 ? parseCooldown(msg, 429) : 60 * 1000);
       }
+      // 账号被封禁/无效凭证：记录并强制永久冷却，清理会话
+      if (/banned|country_blocked|country_not_allowed|token_invalid|unauthorized/i.test(msg)) {
+        invalidateSessionCache(token);
+        cooldown(token, MAX_COOLDOWN_MS);
+      }
       lastErrMsg = msg;
       if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
     }
   }
+
+  // 若账号池全部失效（例如全被封禁或凭证失效），给出明确排查指引
+  if (/banned|country_blocked|country_not_allowed|token_invalid|403|401/i.test(lastErrMsg)) {
+    const deadAccounts = pool.filter((a) => {
+      const h = acctHealth.get(a.token);
+      return h && HEALTH_PERMANENT_STATES.has(h.state);
+    }).length;
+    if (deadAccounts === pool.length) {
+      lastErrMsg = `All ${pool.length} account(s) in FREEBUFF_TOKEN pool are unavailable (${lastErrMsg}). Please update FREEBUFF_TOKEN in your Vercel Dashboard / environment variables with fresh active accounts.`;
+    }
+  }
+
   return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502);
 }
 
@@ -2496,7 +2763,7 @@ function pipeUpstreamToClient(upstreamBody, writable, onComplete, options = {}) 
   });
 
   // sanitize 模式状态
-  const xmlFilter = sanitize ? new StreamingXmlFilter() : null;
+  const xmlFilter = sanitize ? new StreamingXmlFilter({ stripFences: bashFallbackEnabled }) : null;
   let rawTextAccumulator = "";
   const nativeToolItems = new Map(); // index -> { id, callId, name, args }
 
@@ -2705,6 +2972,10 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
   }
   // 空流（200 但无任何数据）：视为脏 session，交给调用方重建后重试（审计 2.7）
   if (!sawAny) throw new EmptyUpstreamStreamError();
+  // P4：非流式路径同样剥离 <thinking>/<thought>/<commentary> 等抑制标签
+  // （与流式 StreamingXmlFilter 对齐；DeepSeek 非流式偶发在工具上下文外直吐 thinking）。
+  // getVisibleCleanText 幂等，纯文本不受影响。P2 fence 剥离同步回退开关。
+  if (content) content = getVisibleCleanText(content, { stripFences: bashFallbackEnabled });
   const msg = { role: "assistant", content };
   if (toolCalls.size > 0) {
     msg.tool_calls = Array.from(toolCalls.values());
@@ -2803,6 +3074,9 @@ function buildNodeWriteFileScript(filePath, fileContent) {
   const b64Content = toBase64(fileContent);
   const byteLen = getByteLength(fileContent);
 
+  // P7 不变量：4000 是 base64 字符数 ≈ 3000 原始字节（4/3 膨胀率），保持 argv 长度安全。
+  // base64 按 4 字符对齐，切片拼接后仍是合法 base64（尾部 padding 只出现在最后一块），
+  // 故按字符切分即字节安全——改动此数时必须保持该语义。
   if (b64Content.length <= 4000) {
     const writeCmd = `node -e 'const fs=require(''fs''),p=require(''path'');const f=Buffer.from(process.argv[1],''base64'').toString();const d=Buffer.from(process.argv[2],''base64'');fs.mkdirSync(p.dirname(p.resolve(f)),{recursive:true});fs.writeFileSync(f,d);console.log(''Successfully wrote ''+d.length+'' bytes to ''+f);' "${b64Path}" "${b64Content}"`;
     return `text(await tools.exec_command({ cmd: ${JSON.stringify(writeCmd)} }));`;
@@ -2832,7 +3106,14 @@ text("Successfully wrote " + ${byteLen} + " bytes to " + ${JSON.stringify(filePa
 
 function buildNodeReadFileScript(filePath) {
   const b64Path = toBase64(filePath);
-  const readCmd = `node -e 'const fs=require(''fs'');const f=Buffer.from(process.argv[1],''base64'').toString();try{process.stdout.write(fs.readFileSync(f));}catch(e){console.error(e.message);process.exit(1);}' "${b64Path}"`;
+  // P3：先 stat 体积，超限直接 exit 1（错误经 stderr 回传客户端），避免把 100MB 日志/
+  // 二进制整个读进 stdout 拖死沙箱。limit 由 FREEBUFF_MAX_READ_FILE_BYTES 决定
+  // （默认 524288；0 = 不限），bake 为字面量进脚本。
+  const lim = maxReadFileBytes > 0 ? maxReadFileBytes : 0;
+  const guard = lim > 0
+    ? "const s=fs.statSync(f).size;if(s>" + lim + "){console.error('file too large: '+s+' bytes (limit " + lim + ")');process.exit(1);}"
+    : "";
+  const readCmd = `node -e 'const fs=require(''fs'');const f=Buffer.from(process.argv[1],''base64'').toString();try{` + guard + `process.stdout.write(fs.readFileSync(f));}catch(e){console.error(e.message);process.exit(1);}' "${b64Path}"`;
   return `text(await tools.exec_command({ cmd: ${JSON.stringify(readCmd)} }));`;
 }
 
@@ -2993,6 +3274,9 @@ function sanitizeToolPayload(rawFnName, args, clientTools = [], preserveNames = 
     // Codex 的 apply_patch 是 FREEFORM 工具：arguments 必须是裸 patch 文本。
     // JSON 包装（{"patch":...}）会被当作 patch 内容解析失败 → Codex 报 "The patch tool is aborting"。
     // 仅当客户端显式声明了 JSON 版 apply_patch 函数工具时才保留 {patch} 对象包装。
+    // P7 说明——声明形状决定分支：
+    //   Codex CLI 声明 apply_patch 为 type:"custom"（无 .function 包装）→ jsonDeclared=false → 返回裸字符串 ✅
+    //   Claude Code/函数式客户端声明 type:"function"（或带 .function）→ jsonDeclared=true → 返回 {patch} 对象 ✅
     const jsonDeclared = Array.isArray(clientTools) && clientTools.some((t) => {
       const dn = (t?.name || t?.function?.name || "").toLowerCase();
       return (dn === "apply_patch" || dn === "patch" || dn === "edit_file") && (t?.type === "function" || t?.function);
@@ -3041,13 +3325,21 @@ const STRIP_TAGS = new Set([
 ]);
 
 class StreamingXmlFilter {
-  constructor() {
-    this.state = "NORMAL"; // "NORMAL" | "TAG_READING" | "SUPPRESSED" | "SUPPRESSED_TAG_READING"
+  constructor(opts = null) {
+    this.state = "NORMAL"; // "NORMAL" | "TAG_READING" | "SUPPRESSED" | "SUPPRESSED_TAG_READING" | "FENCE_MAYBE" | "FENCE_SUPPRESSED" | "FENCE_CLOSE"
     this.tagBuf = "";
+    // stripFences=false 时 fence 原样放行（FREEBUFF_BASH_FALLBACK=0：不转 exec 也不吞文本）。
+    // 缺省不剥 fence：仅上游输出路径显式 opt-in（客户端输入清洗等调用保持原样）。
+    this.stripFences = !!(opts && opts.stripFences);
     // F2 修正：名字感知的抑制栈。旧实现只有 suppressDepth 计数，
     // 不匹配的闭合标签（如顶层悬空的 </invoke>）会让深度偏移，导致后续文本被误吞或标签泄露。
     // 现在按标签名精确配对：只有真正闭合栈顶同名标签才退栈。
     this.suppressStack = []; // 栈内是当前处于抑制状态的标签名（小写）
+    // P2：fenced shell 代码块抑制。DeepSeek 回退模式直吐 ```bash 块时，实时增量里
+    // 的 fence 原文同样不能上屏（否则 parse 回退转成的 exec 会与 markdown 原文双显）。
+    // 仅 shell 系语言（bash|sh|shell|zsh）进抑制；无语言/其它语言 fences 原样放行。
+    this.fenceBuf = "";
+    this.fenceClose = 0;
   }
 
   feed(chunk) {
@@ -3061,8 +3353,54 @@ class StreamingXmlFilter {
         if (ch === "<") {
           this.state = "TAG_READING";
           this.tagBuf = "<";
+        } else if (ch === "`") {
+          // P2：可能是 fenced 代码块 opener，先缓冲再判定（行内 `code` 1-2 字符内即回放，无延迟影响）
+          // stripFences=false（回退总开关关闭）时直接放行
+          if (!this.stripFences) output += ch;
+          else { this.state = "FENCE_MAYBE"; this.fenceBuf = "`"; }
         } else {
           output += ch;
+        }
+      } else if (this.state === "FENCE_MAYBE") {
+        const buf = this.fenceBuf;
+        if (/^`{1,2}$/.test(buf) && ch === "`") {
+          this.fenceBuf += ch;
+        } else if (/^```$/.test(buf) && /[a-zA-Z]/.test(ch)) {
+          this.fenceBuf += ch;
+        } else if (/^```[a-zA-Z]+$/.test(buf) && /[a-zA-Z]/.test(ch) && buf.length < 16) {
+          this.fenceBuf += ch;
+        } else if (/^```[a-zA-Z]+$/.test(buf) && (ch === "\n" || ch === "\r")) {
+          const lang = buf.slice(3).toLowerCase();
+          const isShell = lang === "bash" || lang === "sh" || lang === "shell" || lang === "zsh";
+          if (isShell) {
+            // shell 系 fence：吞掉 opener（含换行），进入块抑制
+            this.fenceBuf = "";
+            this.fenceClose = 0;
+            this.state = "FENCE_SUPPRESSED";
+          } else {
+            output += buf + ch;
+            this.fenceBuf = "";
+            this.state = "NORMAL";
+          }
+        } else {
+          // 非 fence（行内反引号 / 无语言 fence / 超长）：原样回放，不吞用户文本
+          output += buf + ch;
+          this.fenceBuf = "";
+          this.state = "NORMAL";
+        }
+      } else if (this.state === "FENCE_SUPPRESSED") {
+        // 块内全部吞掉，直到遇到 closes ```（与 opener 同行判定无关，任意位置闭合）
+        if (ch === "`") {
+          this.fenceClose++;
+          if (this.fenceClose >= 3) this.state = "FENCE_CLOSE";
+        } else {
+          this.fenceClose = 0;
+        }
+      } else if (this.state === "FENCE_CLOSE") {
+        // 吞掉闭合行剩余字符（含换行），回到正常文本
+        if (ch === "\n") {
+          this.fenceClose = 0;
+          this.state = "NORMAL";
         }
       } else if (this.state === "TAG_READING") {
         this.tagBuf += ch;
@@ -3166,7 +3504,12 @@ class StreamingXmlFilter {
         output += this.tagBuf;
       }
     }
+    // P2：流在 fence 判定中途结束（如下游截断）→ 回放缓冲，绝不吞用户文本；
+    // 已进入抑制的未闭合 fence 则吞掉（与 F2 未闭合标签语义一致）。
+    if (this.state === "FENCE_MAYBE" && this.fenceBuf) output += this.fenceBuf;
     this.tagBuf = "";
+    this.fenceBuf = "";
+    this.fenceClose = 0;
     this.state = "NORMAL";
     this.suppressStack = [];
     return output;
@@ -3203,9 +3546,9 @@ class StreamingXmlFilter {
   }
 }
 
-function getVisibleCleanText(rawText) {
+function getVisibleCleanText(rawText, opts = null) {
   if (!rawText || typeof rawText !== "string") return "";
-  const filter = new StreamingXmlFilter();
+  const filter = new StreamingXmlFilter(opts);
   const out = filter.feed(rawText);
   const text = out + filter.flush();
   // 折叠被剥掉工具块后残留的连续空行（如 </exec_command> 后多出的 \n\n）
@@ -3220,9 +3563,34 @@ function normalizeTagPrefixes(rawText) {
     (m, slash, tag) => `<${slash}${tag}`);
 }
 
+// P2：DeepSeek 回退模式——DSML/XML 全失败时把单个 fenced shell 代码块当 exec。
+// 保守门控：仅当已解析出 0 个 toolCalls、非 Anthropic 保留原名路径、开关开启、
+// 且 fence 语言明确是 shell 系（bash|sh|shell|zsh）时才转；纯 ``` 无语言 fences
+// 常为普通代码示例，不转。命中后 fence 从正文移除（不向客户端泄露 markdown）。
+// FREEBUFF_BASH_FALLBACK=0 可关闭。
+function extractBashFenceFallback(cleanedText, clientTools, preserveToolNames) {
+  if (!bashFallbackEnabled || preserveToolNames) return null;
+  if (!Array.isArray(clientTools)) clientTools = [];
+  const fenceRe = /```(?:bash|sh|shell|zsh)[ \t]*\r?\n([\s\S]*?)```/i;
+  const m = fenceRe.exec(cleanedText || "");
+  if (!m) return null;
+  // 去 shell 提示符 "$ "（行首），保留 $HOME 等行内变量
+  const cmd = String(m[1] || "").replace(/^\s*\$\s?/gm, "").trim();
+  if (!cmd) return null;
+  const sanitized = sanitizeToolPayload("exec_command", { command: cmd }, clientTools, false);
+  if (!sanitized || sanitized.drop) return null;
+  return {
+    call: {
+      id: genId("call_"),
+      name: sanitized.fnName,
+      arguments: typeof sanitized.args === "string" ? sanitized.args : JSON.stringify(sanitized.args),
+    },
+    fence: m[0],
+  };
+}
+
 function parseXmlToolCallsAndCommentary(rawText, clientTools = [], preserveToolNames = false) {
   if (!rawText || typeof rawText !== "string") return { cleanedText: rawText || "", commentary: "", toolCalls: [] };
-  
   let cleanedText = normalizeTagPrefixes(rawText);
   
   // Extract attempt_completion / result content directly into cleanedText (this is the final answer)
@@ -3316,7 +3684,16 @@ function parseXmlToolCallsAndCommentary(rawText, clientTools = [], preserveToolN
     });
   }
 
-  cleanedText = getVisibleCleanText(cleanedText).trim();
+  // P2 回退：XML/native 全无产出时尝试 fenced bash 块 → exec（仅第一块，避免多块歧义）
+  if (toolCalls.length === 0) {
+    const fb = extractBashFenceFallback(cleanedText, clientTools, preserveToolNames);
+    if (fb) {
+      toolCalls.push(fb.call);
+      cleanedText = cleanedText.replace(fb.fence, "");
+    }
+  }
+
+  cleanedText = getVisibleCleanText(cleanedText, { stripFences: bashFallbackEnabled }).trim();
 
   return { cleanedText, commentary: commentaryParts.join("\n\n"), toolCalls };
 }
@@ -3392,7 +3769,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onCompl
   let contentItem = null;
   let reasoningItem = null; // 推理 item（M4：推理用规范 reasoning item + summary_text 事件）
   let rawTextAccumulator = "";
-  const xmlFilter = dsmlPassthrough ? null : new StreamingXmlFilter();
+  const xmlFilter = dsmlPassthrough ? null : new StreamingXmlFilter({ stripFences: bashFallbackEnabled });
   const nativeToolItems = new Map(); // 上游原生 tool_calls index → {id, callId, name, args, outputIndex, started}
 
   (async () => {
@@ -3867,6 +4244,12 @@ function cleanCache() {
         if (k === GLOBAL_CHAIN_KEY) continue;
         const lastAt = entry && typeof entry.lastAt === "number" ? entry.lastAt : 0;
         if (!Number.isFinite(lastAt) || now - lastAt > 60 * 60 * 1000) chainTails.delete(k);
+      }
+    } catch {}
+    // P9 循环追踪表：超 TTL 即清（会话级短期状态，不跨小时残留）
+    try {
+      for (const [k, st] of loopTracker) {
+        if (!st || !Number.isFinite(st.ts) || now - st.ts > LOOP_TRACKER_TTL_MS) loopTracker.delete(k);
       }
     } catch {}
   } catch {}
