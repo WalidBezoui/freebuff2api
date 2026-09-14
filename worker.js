@@ -2,7 +2,7 @@ const CODEBUFF_API = "https://www.codebuff.com";
 // 可被 env.CODEBUFF_API 覆盖的中继地址（fetch 入口每次请求时同步；默认直连官方）
 let activeCodebuffApi = CODEBUFF_API;
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
-const VERSION = "1.9.7";
+const VERSION = "1.9.8";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 输入保护（安全加固）：限制畸形/超大请求，防止不必要地消耗上游额度
@@ -650,9 +650,13 @@ function recordAccountObservation(token, status, dataOrText, extra = {}) {
     checkedAt: Date.now(),
   });
 
-  // 永久性失效状态（封禁/凭证失效）：立即清理会话缓存并强制最大冷却，防止本实例后续误选
+  // 永久性失效状态（封禁/凭证失效）：立即清理会话+run 链缓存并强制最大冷却，防止本实例后续误选
   if (HEALTH_PERMANENT_STATES.has(state)) {
     invalidateSessionCache(token);
+    const rprefix = token + ":";
+    for (const key of runCache.keys()) {
+      if (key.startsWith(rprefix)) runCache.delete(key);
+    }
     cooldown(token, MAX_COOLDOWN_MS);
   }
 }
@@ -692,9 +696,20 @@ function summarizeAccountHealth(pool, health) {
   };
 }
 
-function pickToken(env, sessionModel) {
+function pickToken(env, sessionModel, excludeSet) {
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
+  // 本请求内已试过的号不再返回：防止同请求内重复选中同一失败 token
+  //（session 亲和 + 轮询都可能回指同一号，冷却只是概率防护）。
+  const excluded = excludeSet instanceof Set ? excludeSet : null;
+  const freshPool = excluded ? pool.filter((a) => !excluded.has(a.token)) : pool;
+  if (freshPool.length === 0) return null;
+  // 剩余候选全部永久性死亡时快速失败：不再回退到全池浪费一次上游 403，
+  // 由调用方直接返回带 Retry-After 的 502（Codex 退避而非重试风暴）。
+  if (freshPool.every((a) => {
+    const h = acctHealth.get(a.token);
+    return h && HEALTH_PERMANENT_STATES.has(h.state);
+  })) return null;
 
   // 清理瞬态限流的过期冷却 + 已恢复 ok 的残留冷却：健康观察过期或已明确 ok，但 cooldowns 仍有 6h 旧值
   // 会造成 shadow-lock（health 已恢复但 cooldown 仍钉死账号数小时）— 永久状态不清理
@@ -710,13 +725,14 @@ function pickToken(env, sessionModel) {
 
   // v1.6.0：跳过已探测为失效的号（alive=false）；未探测/探测失败的不跳过（避免误杀）。
 // 瞬态失效（429 限流等）在观察 TTL 后重新纳入轮询，不再永久剔除；永久状态长期剔除。
-const alivePool = pool.filter((acct) => {
+const alivePool = freshPool.filter((acct) => {
     const h = acctHealth.get(acct.token);
     if (!h || h.alive !== false) return true;
     if (HEALTH_PERMANENT_STATES.has(h.state)) return false;
     return Date.now() - h.checkedAt > HEALTH_TRANSIENT_TTL_MS;
   });
-  const usePool = alivePool.length > 0 ? alivePool : pool; // 全失效时回退全池，让请求继续（由 429 冷却接管）
+  // 全失效回退只保留给瞬态限流（由 429 冷却接管）；永久性全死已在入口返回 null。
+  const usePool = alivePool.length > 0 ? alivePool : freshPool;
 
   // v1.8.5.1：账号选择恢复为稳定轮询。
   // rateLimitsByModel 仅作为观测数据，不参与轮询顺序；真实 session/chat
@@ -745,7 +761,9 @@ const alivePool = pool.filter((acct) => {
     const t = acct.token;
     if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return acct;
   }
-  const oldest = [...cooldowns.entries()].sort((a, b) => a[1] - b[1])[0];
+  const oldest = [...cooldowns.entries()]
+    .filter(([tok]) => finalPool.some((a) => a.token === tok))
+    .sort((a, b) => a[1] - b[1])[0];
   if (oldest) {
     // 淘汰最早的冷却，并返回那个号（它刚被解除冷却，且必然属于账号池）。
     // 原实现返回 finalPool[0]，可能与被淘汰的不是同一号，导致返回的号仍在冷却中。
@@ -905,6 +923,40 @@ function invalidateSessionCache(token) {
   for (const key of sessCache.keys()) {
     if (key.startsWith(prefix)) sessCache.delete(key);
   }
+}
+
+// 永久性失效（封禁/凭证失效）必须连同 run 链缓存一起清理：run_id 绑定旧
+// session，残留 run_id 会在 session 重建后持续 502（同 stale-session 路径
+// 已有的 runCache.delete 兜底语义）。loopTracker 为纯文本启发式计数，
+// 随 TTL/上限自然过期，无需在此清理。
+function invalidateAccountCaches(token) {
+  invalidateSessionCache(token);
+  const prefix = token + ":";
+  for (const key of runCache.keys()) {
+    if (key.startsWith(prefix)) runCache.delete(key);
+  }
+}
+
+// 账号池是否全部永久性死亡（封禁/凭证失效/地区受限等）：调用方据此快速失败，
+// 不再浪费一次上游 403。瞬态限流（rate_limited）不计入——过期后可恢复。
+function isPoolPermanentlyDead(pool) {
+  if (!Array.isArray(pool) || pool.length === 0) return false;
+  return pool.every((a) => {
+    const h = acctHealth.get(a.token);
+    return h && HEALTH_PERMANENT_STATES.has(h.state);
+  });
+}
+
+// 最终 502 诊断后缀：banned vs rate_limited 分开计数，客户端一眼区分
+// “补号”（banned/country_blocked/token_invalid）还是“等配额”（rate_limited）。
+function poolStateBreakdown(pool) {
+  const counts = {};
+  for (const a of pool) {
+    const h = acctHealth.get(a.token);
+    const st = (h && h.state) || "unknown";
+    counts[st] = (counts[st] || 0) + 1;
+  }
+  return Object.entries(counts).map(([k, v]) => k + ":" + v).join(", ");
 }
 
 async function deleteUpstreamSession(token, instanceId) {
@@ -2174,10 +2226,16 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
   }
 
   let lastErrMsg = "";
+  const triedTokens = new Set();
+  if (isPoolPermanentlyDead(pool)) {
+    lastErrMsg = `All ${pool.length} account(s) in FREEBUFF_TOKEN pool are unavailable (states={${poolStateBreakdown(pool)}}). Please update FREEBUFF_TOKEN in your Vercel Dashboard / environment variables with fresh active accounts.`;
+    return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502, { "Retry-After": "300" });
+  }
   for (let acctTry = 0; acctTry < pool.length; acctTry++) {
-    const acct = pickToken(env, mc.session);
+    const acct = pickToken(env, mc.session, triedTokens);
     const token = acct ? acct.token : null;
     if (!token) break;
+    triedTokens.add(token);
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
     let rootRunId = null;
@@ -2241,6 +2299,11 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
       if (/start_run failed|timeout|timed out|abort|reviewer upstream/i.test(lastErrMsg)) cooldown(token, 60 * 1000);
     }
   }
+  if (/banned|country_blocked|country_not_allowed|token_invalid|403|401/i.test(lastErrMsg)
+    && isPoolPermanentlyDead(pool)) {
+    lastErrMsg = `All ${pool.length} account(s) in FREEBUFF_TOKEN pool are unavailable (states={${poolStateBreakdown(pool)}}; ${lastErrMsg}). Please update FREEBUFF_TOKEN in your Vercel Dashboard / environment variables with fresh active accounts.`;
+    return jsonResponse({ error: { message: lastErrMsg || "code reviewer failed", type: "api_error" } }, 502, { "Retry-After": "300" });
+  }
   return jsonResponse({ error: { message: lastErrMsg || "code reviewer failed", type: "api_error" } }, 502);
 }
 
@@ -2256,12 +2319,20 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
   // 请求内多号重试：一个号失败（超时/429/428 重建无效/run 失败）立即冷却并换下一个号，最多试完整个账号池。
   // 免费通道上游波动大（并发>1 即出问题、排队超时），单请求内换号比等客户端重试成功率高得多。
   let lastErrMsg = "";
+  // 本请求内已试 token：pickToken 不再返回它们，避免同请求重复选中同一失败号。
+  const triedTokens = new Set();
+  // 池内全部已知永久性死亡时直接快速失败，不浪费上游 403（pickToken 同样会返回 null）。
+  if (isPoolPermanentlyDead(pool)) {
+    lastErrMsg = `All ${pool.length} account(s) in FREEBUFF_TOKEN pool are unavailable (states={${poolStateBreakdown(pool)}}). Please update FREEBUFF_TOKEN in your Vercel Dashboard / environment variables with fresh active accounts.`;
+    return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502, { "Retry-After": "300" });
+  }
   // P9 计数阶段：每请求一次（首个可用 token 绑定会话身份），统计同命令连续失败
   let loopCounted = false;
   for (let acctTry = 0; acctTry < pool.length; acctTry++) {
-    const acct = pickToken(env, mc.session);
+    const acct = pickToken(env, mc.session, triedTokens);
     const token = acct ? acct.token : null;
     if (!token) break;
+    triedTokens.add(token);
     if (!loopCounted) {
       loopCounted = true;
       updateLoopTracker(token, mc.session, chatParams.messages);
@@ -2453,9 +2524,9 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
         const m429 = msg.match(/429/);
         cooldown(token, m429 ? parseCooldown(msg, 429) : 60 * 1000);
       }
-      // 账号被封禁/无效凭证：记录并强制永久冷却，清理会话
+      // 账号被封禁/无效凭证：记录并强制永久冷却，清理会话 + run 链缓存
       if (/banned|country_blocked|country_not_allowed|token_invalid|unauthorized/i.test(msg)) {
-        invalidateSessionCache(token);
+        invalidateAccountCaches(token);
         cooldown(token, MAX_COOLDOWN_MS);
       }
       lastErrMsg = msg;
@@ -2463,14 +2534,17 @@ async function executeChat(env, chatParams, mc, isStream, mode, opts = {}) {
     }
   }
 
-  // 若账号池全部失效（例如全被封禁或凭证失效），给出明确排查指引
+  // 若账号池全部失效（例如全被封禁或凭证失效），给出明确排查指引 +
+  // 按状态分列计数（banned 补号 vs rate_limited 等配额），并带 Retry-After
+  // 让 Codex 退避 5 分钟而非重试风暴 hammering 死池。
   if (/banned|country_blocked|country_not_allowed|token_invalid|403|401/i.test(lastErrMsg)) {
     const deadAccounts = pool.filter((a) => {
       const h = acctHealth.get(a.token);
       return h && HEALTH_PERMANENT_STATES.has(h.state);
     }).length;
     if (deadAccounts === pool.length) {
-      lastErrMsg = `All ${pool.length} account(s) in FREEBUFF_TOKEN pool are unavailable (${lastErrMsg}). Please update FREEBUFF_TOKEN in your Vercel Dashboard / environment variables with fresh active accounts.`;
+      lastErrMsg = `All ${pool.length} account(s) in FREEBUFF_TOKEN pool are unavailable (states={${poolStateBreakdown(pool)}}; ${lastErrMsg}). Please update FREEBUFF_TOKEN in your Vercel Dashboard / environment variables with fresh active accounts.`;
+      return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502, { "Retry-After": "300" });
     }
   }
 

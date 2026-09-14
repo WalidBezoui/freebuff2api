@@ -1,6 +1,6 @@
 {
   "name": "freebuff-api",
-  "version": "1.9.7",
+  "version": "1.9.8",
   "type": "module",
   "private": true,
   "main": "index.js",

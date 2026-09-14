@@ -324,6 +324,14 @@ curl -N https://你的worker.workers.dev/v1/chat/completions \
 
 > 注意：冷却状态存在 Worker 内存，冷启动后重置；并发多实例间不共享。日常使用影响不大。
 
+**封号隔离与恢复**（当前版本）：
+
+- 上游判定永久失效（`banned` / `country_blocked` / `token_invalid` / `blocked` / `model_locked` / `ip_capped`）的账号会被自动隔离：清会话 + run 链缓存、6 小时冷却，同 isolate 内不再选中；`GET /healthz`（免鉴权、只读本地缓存、零上游成本）可查各号 `acct-N` 状态。
+- 同一请求内失败自动换号（已试过的号不再重选）；若全池永久死亡则直接返回 `502 + Retry-After: 300`（含 `states={banned:1, rate_limited:1}` 分列计数），让客户端退避而非重试风暴。
+- `banned` 为终态、不可恢复：从 `FREEBUFF_TOKEN` 移除该 token，补充新账号后在 Vercel（Production + Preview）保存并**重新部署**；对照 `/healthz` 的 `version` 确认线上已更新。
+
+**防封 hygiene**：一个账号同一时间只给一个客户端/代理用（单账号单会话限制）；不要直连非美区 IP 测试（会 `country_blocked`）；不要并发 burst 建 session（免费额度约每天 6 次创建/账号，turn 内复用不扣）；池子保持 ≥3 个可用账号，一个死亡不清空冗余；`banned` 申诉走 support@codebuff.com，不要“重试穿过去”。
+
 ## 🔍 上游门控说明
 
 freebuff 免费模型不是"拿 token 直接调 chat"就行，而是有严格生命周期：
